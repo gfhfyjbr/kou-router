@@ -1,15 +1,15 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     body::Body,
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::post,
-    Json, Router,
 };
 use http_body_util::BodyExt;
-use kou_router::{build_app, init_db, routes::AppState, SqliteRepository};
-use serde_json::{json, Value};
+use kou_router::{SqliteRepository, build_app, init_db, routes::AppState};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -98,7 +98,12 @@ async fn test_auth_status_initially_no_auth() {
     let app = build_app(state);
 
     let resp = app
-        .oneshot(Request::builder().uri("/api/auth/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -132,7 +137,12 @@ async fn test_auth_setup_creates_admin() {
 
     // Check status changed
     let resp = app
-        .oneshot(Request::builder().uri("/api/auth/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -280,7 +290,12 @@ async fn test_management_endpoints_blocked_without_auth() {
 
     // Try to list keys with no credentials
     let resp = app
-        .oneshot(Request::builder().uri("/api/keys").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -334,7 +349,10 @@ async fn test_api_key_create_list_revoke() {
 
     let created: Value = json_body(resp).await;
     let key_id = created["id"].as_str().expect("key must have id");
-    assert!(created["key"].as_str().is_some(), "response must include the raw key");
+    assert!(
+        created["key"].as_str().is_some(),
+        "response must include the raw key"
+    );
 
     // List keys — should contain the one we created
     let resp = app
@@ -388,7 +406,9 @@ async fn test_api_key_create_list_revoke() {
     let keys: Value = json_body(resp).await;
     let keys_arr = keys.as_array().expect("keys should be an array");
     assert!(
-        !keys_arr.iter().any(|k| k["id"].as_str() == Some(key_id) && k["is_active"] == true),
+        !keys_arr
+            .iter()
+            .any(|k| k["id"].as_str() == Some(key_id) && k["is_active"] == true),
         "revoked key must not appear as active"
     );
 }
@@ -419,7 +439,10 @@ async fn test_proxy_with_api_key() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let created: Value = json_body(resp).await;
-    let api_key = created["key"].as_str().expect("must get raw key").to_string();
+    let api_key = created["key"]
+        .as_str()
+        .expect("must get raw key")
+        .to_string();
 
     // Spawn mock upstream and register a provider
     let mock_body = json!({
@@ -530,7 +553,12 @@ async fn test_auth_not_required_allows_anonymous() {
 
     // No auth setup — anonymous access should work
     let resp = app
-        .oneshot(Request::builder().uri("/api/keys").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

@@ -63,14 +63,16 @@ impl ProtocolFormat {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::models::EndpointKind;
+    use serde_json::json;
 
-    fn make_provider(provider: &str, protocol_format: Option<&str>) -> crate::models::ProviderConnection {
+    fn make_provider(
+        provider: &str,
+        protocol_format: Option<&str>,
+    ) -> crate::models::ProviderConnection {
         crate::models::ProviderConnection {
             id: String::new(),
             provider: provider.to_string(),
@@ -108,31 +110,46 @@ mod tests {
     #[test]
     fn test_detect_source_messages() {
         let body = json!({});
-        assert_eq!(ProtocolFormat::detect_source(EndpointKind::Messages, &body), ProtocolFormat::Claude);
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::Messages, &body),
+            ProtocolFormat::Claude
+        );
     }
 
     #[test]
     fn test_detect_source_responses() {
         let body = json!({});
-        assert_eq!(ProtocolFormat::detect_source(EndpointKind::Responses, &body), ProtocolFormat::OpenAIResponses);
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::Responses, &body),
+            ProtocolFormat::OpenAIResponses
+        );
     }
 
     #[test]
     fn test_detect_source_ollama() {
         let body = json!({});
-        assert_eq!(ProtocolFormat::detect_source(EndpointKind::OllamaChat, &body), ProtocolFormat::Ollama);
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::OllamaChat, &body),
+            ProtocolFormat::Ollama
+        );
     }
 
     #[test]
     fn test_detect_source_chat() {
         let body = json!({});
-        assert_eq!(ProtocolFormat::detect_source(EndpointKind::ChatCompletions, &body), ProtocolFormat::OpenAI);
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::ChatCompletions, &body),
+            ProtocolFormat::OpenAI
+        );
     }
 
     #[test]
     fn test_detect_source_embeddings() {
         let body = json!({});
-        assert_eq!(ProtocolFormat::detect_source(EndpointKind::Embeddings, &body), ProtocolFormat::OpenAI);
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::Embeddings, &body),
+            ProtocolFormat::OpenAI
+        );
     }
 
     #[test]

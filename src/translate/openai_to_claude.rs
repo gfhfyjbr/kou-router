@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::common::*;
 use crate::error::{AppError, AppResult};
@@ -9,7 +9,9 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
     let messages = body["messages"]
         .as_array()
         .filter(|m| !m.is_empty())
-        .ok_or_else(|| AppError::BadRequest("messages array is required and must not be empty".into()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("messages array is required and must not be empty".into())
+        })?;
 
     // Partition system messages from the rest.
     let mut system_texts: Vec<&str> = Vec::new();
@@ -144,7 +146,6 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
 
     Ok(result)
 }
-
 
 #[cfg(test)]
 mod tests {

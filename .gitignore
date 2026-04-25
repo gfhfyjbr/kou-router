@@ -1,1 +1,13 @@
 /target
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local databases / runtime data
+/.data
+
+# Vendored reference repos (kept locally only)
+/OmniRoute-upstream
+/claude-code-sourcemap
+/codex

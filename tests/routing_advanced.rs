@@ -1,15 +1,15 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     body::Body,
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::post,
-    Json, Router,
 };
 use http_body_util::BodyExt;
-use kou_router::{build_app, init_db, routes::AppState, SqliteRepository};
-use serde_json::{json, Value};
+use kou_router::{SqliteRepository, build_app, init_db, routes::AppState};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -280,13 +280,7 @@ async fn test_alias_resolution_in_routing() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(new_provider(
-            "p1",
-            mock,
-            "p1",
-            "Provider1",
-            "p1/real-model",
-        ))
+        .create_provider_connection(new_provider("p1", mock, "p1", "Provider1", "p1/real-model"))
         .await
         .unwrap();
     state
@@ -398,10 +392,7 @@ async fn test_provider_priority_ordering() {
     let (status, payload) = chat_request(&app, "prio/m").await;
     assert_eq!(status, StatusCode::OK);
     // priority=1 tried first, succeeds immediately → content from high-priority mock
-    assert_eq!(
-        payload["choices"][0]["message"]["content"],
-        "high-priority"
-    );
+    assert_eq!(payload["choices"][0]["message"]["content"], "high-priority");
 }
 
 #[tokio::test]
@@ -433,10 +424,7 @@ async fn test_protocol_translation_claude_provider() {
         payload["id"].as_str().unwrap().contains("msg_123"),
         "id should contain original Claude id"
     );
-    assert_eq!(
-        payload["choices"][0]["message"]["content"],
-        "translated-hi"
-    );
+    assert_eq!(payload["choices"][0]["message"]["content"], "translated-hi");
     assert_eq!(payload["choices"][0]["message"]["role"], "assistant");
     assert_eq!(payload["choices"][0]["finish_reason"], "stop");
     assert_eq!(payload["usage"]["prompt_tokens"], 5);

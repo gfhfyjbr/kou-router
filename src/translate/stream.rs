@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::common::{claude_stop_to_openai_finish, gemini_finish_to_openai};
@@ -32,9 +32,8 @@ pub fn claude_chunk_to_openai(chunk_data: &str) -> AppResult<Option<String>> {
 
     match event {
         "content_block_delta" => {
-            let data_str = data_line.ok_or_else(|| {
-                AppError::BadRequest("content_block_delta missing data".into())
-            })?;
+            let data_str = data_line
+                .ok_or_else(|| AppError::BadRequest("content_block_delta missing data".into()))?;
             let data: Value = serde_json::from_str(data_str)?;
 
             let delta_type = data
@@ -65,15 +64,11 @@ pub fn claude_chunk_to_openai(chunk_data: &str) -> AppResult<Option<String>> {
         }
 
         "message_delta" => {
-            let data_str = data_line.ok_or_else(|| {
-                AppError::BadRequest("message_delta missing data".into())
-            })?;
+            let data_str = data_line
+                .ok_or_else(|| AppError::BadRequest("message_delta missing data".into()))?;
             let data: Value = serde_json::from_str(data_str)?;
 
-            if let Some(stop_reason) = data
-                .pointer("/delta/stop_reason")
-                .and_then(Value::as_str)
-            {
+            if let Some(stop_reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
                 let finish = claude_stop_to_openai_finish(stop_reason);
                 let openai = json!({
                     "id": format!("chatcmpl-{id}"),
@@ -166,7 +161,6 @@ pub fn gemini_chunk_to_openai(chunk_data: &str) -> AppResult<Option<String>> {
 
     Ok(Some(out))
 }
-
 
 #[cfg(test)]
 mod tests {

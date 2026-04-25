@@ -1,8 +1,16 @@
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 
 pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await?;
 
@@ -36,6 +44,8 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             backoff_level INTEGER NOT NULL DEFAULT 0,
             consecutive_use_count INTEGER NOT NULL DEFAULT 0,
             test_status TEXT,
+            account_routing_strategy TEXT NOT NULL DEFAULT 'priority',
+            protocol_format TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -128,13 +138,22 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             .await?;
     }
     if !has_column("backoff_level") {
-        sqlx::query("ALTER TABLE provider_connections ADD COLUMN backoff_level INTEGER NOT NULL DEFAULT 0")
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "ALTER TABLE provider_connections ADD COLUMN backoff_level INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await?;
     }
     if !has_column("consecutive_use_count") {
         sqlx::query(
             "ALTER TABLE provider_connections ADD COLUMN consecutive_use_count INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await?;
+    }
+    if !has_column("account_routing_strategy") {
+        sqlx::query(
+            "ALTER TABLE provider_connections ADD COLUMN account_routing_strategy TEXT NOT NULL DEFAULT 'priority'",
         )
         .execute(&pool)
         .await?;
@@ -144,6 +163,171 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             .execute(&pool)
             .await?;
     }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_accounts (
+            id TEXT PRIMARY KEY,
+            provider_connection_id TEXT NOT NULL,
+            label TEXT,
+            auth_mode TEXT NOT NULL,
+            api_key TEXT,
+            access_token TEXT,
+            refresh_token TEXT,
+            expires_at TEXT,
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            remote_account_id TEXT,
+            remote_email TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT,
+            rate_limited_until TEXT,
+            circuit_open_until TEXT,
+            last_error TEXT,
+            last_error_type TEXT,
+            last_refresh_at TEXT,
+            refresh_error TEXT,
+            backoff_level INTEGER NOT NULL DEFAULT 0,
+            consecutive_use_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(provider_connection_id) REFERENCES provider_connections(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_provider_accounts_connection_priority ON provider_accounts(provider_connection_id, priority, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_provider_accounts_enabled ON provider_accounts(provider_connection_id, enabled)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS oauth_sessions (
+            id TEXT PRIMARY KEY,
+            state TEXT NOT NULL UNIQUE,
+            provider_connection_id TEXT NOT NULL,
+            provider_account_id TEXT,
+            redirect_uri TEXT NOT NULL,
+            code_verifier TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            FOREIGN KEY(provider_connection_id) REFERENCES provider_connections(id) ON DELETE CASCADE,
+            FOREIGN KEY(provider_account_id) REFERENCES provider_accounts(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_sessions_provider_connection ON oauth_sessions(provider_connection_id, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires_at ON oauth_sessions(expires_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS request_debug_logs (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            provider_account_id TEXT,
+            model TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            raw_body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(provider_id) REFERENCES provider_connections(id) ON DELETE CASCADE,
+            FOREIGN KEY(provider_account_id) REFERENCES provider_accounts(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS response_debug_logs (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            provider_account_id TEXT,
+            model TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL DEFAULT 0,
+            upstream_status INTEGER NOT NULL,
+            raw_body TEXT NOT NULL,
+            reasoning_summary_json TEXT,
+            obfuscation_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(provider_id) REFERENCES provider_connections(id) ON DELETE CASCADE,
+            FOREIGN KEY(provider_account_id) REFERENCES provider_accounts(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    let response_debug_log_columns: Vec<String> =
+        sqlx::query("PRAGMA table_info(response_debug_logs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+    if !response_debug_log_columns
+        .iter()
+        .any(|value| value == "sequence_no")
+    {
+        sqlx::query(
+            "ALTER TABLE response_debug_logs ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_request_debug_logs_request_id ON request_debug_logs(request_id, sequence_no, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_request_debug_logs_provider_created_at ON request_debug_logs(provider_id, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_response_debug_logs_request_id ON response_debug_logs(request_id, sequence_no, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_response_debug_logs_provider_created_at ON response_debug_logs(provider_id, created_at)",
+    )
+    .execute(&pool)
+    .await?;
 
     sqlx::query(
         r#"
@@ -184,7 +368,6 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
-    // API keys table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS api_keys (
@@ -204,11 +387,42 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)",
-    )
-    .execute(&pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+        .execute(&pool)
+        .await?;
 
     Ok(pool)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::init_db;
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn test_init_db_creates_request_debug_logs_and_response_sequence() {
+        let pool = init_db("sqlite::memory:").await.unwrap();
+
+        let request_columns = sqlx::query("PRAGMA table_info(request_debug_logs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let request_column_names: Vec<String> = request_columns
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect();
+        assert!(request_column_names.iter().any(|name| name == "sequence_no"));
+        assert!(request_column_names.iter().any(|name| name == "raw_body"));
+
+        let response_columns = sqlx::query("PRAGMA table_info(response_debug_logs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let response_column_names: Vec<String> = response_columns
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect();
+        assert!(response_column_names.iter().any(|name| name == "sequence_no"));
+    }
 }

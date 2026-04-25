@@ -1,16 +1,18 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     body::Body,
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use http_body_util::BodyExt;
-use kou_router::{build_app, init_db, models::OpenAiModelsResponse, routes::AppState, SqliteRepository};
+use kou_router::{
+    SqliteRepository, build_app, init_db, models::OpenAiModelsResponse, routes::AppState,
+};
 use reqwest::multipart;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -253,7 +255,12 @@ async fn spawn_mock_server(status: StatusCode, body: Value) -> String {
 async fn health_endpoint_works() {
     let app = build_app(setup_state().await);
     let response = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -327,7 +334,12 @@ async fn models_include_providers_combos_and_aliases_management_is_persistent() 
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -349,17 +361,32 @@ async fn models_include_providers_combos_and_aliases_management_is_persistent() 
         .await
         .unwrap();
     assert_eq!(aliases_response.status(), StatusCode::OK);
-    let alias_body = aliases_response.into_body().collect().await.unwrap().to_bytes();
+    let alias_body = aliases_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let aliases: Vec<Value> = serde_json::from_slice(&alias_body).unwrap();
     assert_eq!(aliases[0]["alias"], "fast-code");
     assert_eq!(aliases[0]["target"], "mo/gpt-4o-mini");
 
     let settings_response = app
-        .oneshot(Request::builder().uri("/api/settings").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(settings_response.status(), StatusCode::OK);
-    let settings_body = settings_response.into_body().collect().await.unwrap().to_bytes();
+    let settings_body = settings_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let settings: Value = serde_json::from_slice(&settings_body).unwrap();
     assert_eq!(settings["requireAuthForModels"], true);
     assert_eq!(settings["globalFallbackModel"], "mo/gpt-4o-mini");
@@ -524,7 +551,13 @@ async fn model_and_admin_listing_routes_are_supported() {
     assert_eq!(providers.status(), StatusCode::OK);
     let body = providers.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload.as_array().unwrap().iter().any(|item| item["provider"] == "admin-openai"));
+    assert!(
+        payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["provider"] == "admin-openai")
+    );
 
     let combos = app
         .oneshot(
@@ -539,7 +572,13 @@ async fn model_and_admin_listing_routes_are_supported() {
     assert_eq!(combos.status(), StatusCode::OK);
     let body = combos.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(payload.as_array().unwrap().iter().any(|item| item["name"] == "admin-pack"));
+    assert!(
+        payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "admin-pack")
+    );
 }
 
 #[tokio::test]
@@ -566,22 +605,48 @@ async fn chat_completions_fallbacks_to_next_combo_target() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "p1".to_string(), base_url: first, api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("p1".to_string()), name: Some("First".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("p1/fail-model".to_string()),
-        supported_endpoints: None,
-        rate_limit_protection: true, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "p1".to_string(),
+            base_url: first,
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("p1".to_string()),
+            name: Some("First".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("p1/fail-model".to_string()),
+            supported_endpoints: None,
+            rate_limit_protection: true,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "p2".to_string(), base_url: second, api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("p2".to_string()), name: Some("Second".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("p2/success-model".to_string()),
-        supported_endpoints: None,
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "p2".to_string(),
+            base_url: second,
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("p2".to_string()),
+            name: Some("Second".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("p2/success-model".to_string()),
+            supported_endpoints: None,
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
@@ -619,7 +684,10 @@ async fn chat_completions_fallbacks_to_next_combo_target() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["choices"][0]["message"]["content"], "hello from rust port");
+    assert_eq!(
+        payload["choices"][0]["message"]["content"],
+        "hello from rust port"
+    );
     assert_eq!(payload["_kou_router"]["requested_model"], "coding-pack");
     let tried = payload["_kou_router"]["tried"].as_array().unwrap();
     assert_eq!(tried.len(), 2);
@@ -627,8 +695,14 @@ async fn chat_completions_fallbacks_to_next_combo_target() {
     assert_eq!(tried[1]["status"], 200);
 
     let providers = state.repository.list_provider_connections().await.unwrap();
-    let failed = providers.iter().find(|provider| provider.provider == "p1").unwrap();
-    let succeeded = providers.iter().find(|provider| provider.provider == "p2").unwrap();
+    let failed = providers
+        .iter()
+        .find(|provider| provider.provider == "p1")
+        .unwrap();
+    let succeeded = providers
+        .iter()
+        .find(|provider| provider.provider == "p2")
+        .unwrap();
     assert_eq!(failed.test_status.as_deref(), Some("error"));
     assert_eq!(failed.last_error_type.as_deref(), Some("rate_limit"));
     assert!(failed.rate_limited_until.is_some());
@@ -660,22 +734,48 @@ async fn compatibility_endpoints_are_supported() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "p1".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("p1".to_string()), name: Some("Compat".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("p1/compat-model".to_string()),
-        supported_endpoints: None,
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "p1".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("p1".to_string()),
+            name: Some("Compat".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("p1/compat-model".to_string()),
+            supported_endpoints: None,
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "ps".to_string(), base_url: stream_upstream, api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("ps".to_string()), name: Some("Stream".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("ps/stream-model".to_string()),
-        supported_endpoints: None,
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "ps".to_string(),
+            base_url: stream_upstream,
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("ps".to_string()),
+            name: Some("Stream".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("ps/stream-model".to_string()),
+            supported_endpoints: None,
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
 
@@ -724,7 +824,12 @@ async fn compatibility_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(responses_suffix.status(), StatusCode::OK);
-    let body = responses_suffix.into_body().collect().await.unwrap().to_bytes();
+    let body = responses_suffix
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["output"][0]["content"][0]["text"], "suffix-ok");
     assert_eq!(payload["_kou_router"]["path_suffix"], "native/path");
@@ -818,7 +923,10 @@ async fn compatibility_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(stream.status(), StatusCode::OK);
-    assert_eq!(stream.headers().get("content-type").unwrap(), "text/event-stream");
+    assert_eq!(
+        stream.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
     let body = stream.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("data:"));
@@ -832,22 +940,48 @@ async fn embeddings_and_images_endpoints_are_supported() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "embedder".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("embedder".to_string()), name: Some("Embeddings".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("embedder/text-embedding-3-small-1536".to_string()),
-        supported_endpoints: Some(vec!["embeddings".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "embedder".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("embedder".to_string()),
+            name: Some("Embeddings".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("embedder/text-embedding-3-small-1536".to_string()),
+            supported_endpoints: Some(vec!["embeddings".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "imager".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("imager".to_string()), name: Some("Images".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("imager/dall-e-3".to_string()),
-        supported_endpoints: Some(vec!["images".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "imager".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("imager".to_string()),
+            name: Some("Images".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("imager/dall-e-3".to_string()),
+            supported_endpoints: Some(vec!["images".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
 
@@ -865,9 +999,17 @@ async fn embeddings_and_images_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(embedding_catalog.status(), StatusCode::OK);
-    let body = embedding_catalog.into_body().collect().await.unwrap().to_bytes();
+    let body = embedding_catalog
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["data"][0]["id"], "embedder/text-embedding-3-small-1536");
+    assert_eq!(
+        payload["data"][0]["id"],
+        "embedder/text-embedding-3-small-1536"
+    );
     assert_eq!(payload["data"][0]["type"], "embeddings");
     assert_eq!(payload["data"][0]["dimensions"], 1536);
 
@@ -883,7 +1025,12 @@ async fn embeddings_and_images_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(image_catalog.status(), StatusCode::OK);
-    let body = image_catalog.into_body().collect().await.unwrap().to_bytes();
+    let body = image_catalog
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["data"][0]["id"], "imager/dall-e-3");
     assert_eq!(payload["data"][0]["type"], "images");
@@ -947,22 +1094,48 @@ async fn music_and_video_endpoints_are_supported() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "composer".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("composer".to_string()), name: Some("Music".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("composer/musicgen-medium".to_string()),
-        supported_endpoints: Some(vec!["music".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "composer".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("composer".to_string()),
+            name: Some("Music".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("composer/musicgen-medium".to_string()),
+            supported_endpoints: Some(vec!["music".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "director".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("director".to_string()), name: Some("Video".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("director/animatediff".to_string()),
-        supported_endpoints: Some(vec!["video".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "director".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("director".to_string()),
+            name: Some("Video".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("director/animatediff".to_string()),
+            supported_endpoints: Some(vec!["video".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
 
@@ -980,7 +1153,12 @@ async fn music_and_video_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(music_catalog.status(), StatusCode::OK);
-    let body = music_catalog.into_body().collect().await.unwrap().to_bytes();
+    let body = music_catalog
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["data"][0]["id"], "composer/musicgen-medium");
     assert_eq!(payload["data"][0]["type"], "music");
@@ -998,7 +1176,12 @@ async fn music_and_video_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(video_catalog.status(), StatusCode::OK);
-    let body = video_catalog.into_body().collect().await.unwrap().to_bytes();
+    let body = video_catalog
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["data"][0]["id"], "director/animatediff");
     assert_eq!(payload["data"][0]["type"], "video");
@@ -1063,32 +1246,71 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "guard".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("guard".to_string()), name: Some("Moderation".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("guard/omni-moderation-latest".to_string()),
-        supported_endpoints: Some(vec!["moderations".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "guard".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("guard".to_string()),
+            name: Some("Moderation".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("guard/omni-moderation-latest".to_string()),
+            supported_endpoints: Some(vec!["moderations".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "ranker".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("ranker".to_string()), name: Some("Rerank".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("ranker/rerank-v1".to_string()),
-        supported_endpoints: Some(vec!["rerank".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "ranker".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("ranker".to_string()),
+            name: Some("Rerank".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("ranker/rerank-v1".to_string()),
+            supported_endpoints: Some(vec!["rerank".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "search".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("search".to_string()), name: Some("Search".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("search/web".to_string()),
-        supported_endpoints: Some(vec!["search".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "search".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("search".to_string()),
+            name: Some("Search".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("search/web".to_string()),
+            supported_endpoints: Some(vec!["search".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
 
@@ -1106,7 +1328,12 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
         .await
         .unwrap();
     assert_eq!(search_catalog.status(), StatusCode::OK);
-    let body = search_catalog.into_body().collect().await.unwrap().to_bytes();
+    let body = search_catalog
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["data"][0]["id"], "search/web");
     assert_eq!(payload["data"][0]["supported_sizes"][0], "web");
@@ -1272,7 +1499,10 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
             auth_header: "x-api-key".to_string(),
             auth_prefix: None,
             extra_headers: BTreeMap::new(),
-            endpoint_paths: Some(BTreeMap::from([("search".to_string(), "/search".to_string())])),
+            endpoint_paths: Some(BTreeMap::from([(
+                "search".to_string(),
+                "/search".to_string(),
+            )])),
             stream_endpoint_paths: None,
             model_prefix: Some("serper-search".to_string()),
             name: Some("Serper Search".to_string()),
@@ -1321,7 +1551,10 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
             auth_header: "x-api-key".to_string(),
             auth_prefix: None,
             extra_headers: BTreeMap::new(),
-            endpoint_paths: Some(BTreeMap::from([("search".to_string(), format!("{}/search-exa", upstream))])),
+            endpoint_paths: Some(BTreeMap::from([(
+                "search".to_string(),
+                format!("{}/search-exa", upstream),
+            )])),
             stream_endpoint_paths: None,
             model_prefix: Some("exa-search".to_string()),
             name: Some("Exa Search".to_string()),
@@ -1361,7 +1594,10 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["provider"], "serper-search");
     assert_eq!(payload["results"][0]["title"], "Serper Rust");
-    assert_eq!(payload["results"][0]["url"], "https://example.com/serper-rust");
+    assert_eq!(
+        payload["results"][0]["url"],
+        "https://example.com/serper-rust"
+    );
 
     let brave = search_app
         .clone()
@@ -1388,7 +1624,10 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["provider"], "brave-search");
     assert_eq!(payload["results"][0]["title"], "Brave Rust");
-    assert_eq!(payload["results"][0]["favicon_url"], "https://example.com/favicon.ico");
+    assert_eq!(
+        payload["results"][0]["favicon_url"],
+        "https://example.com/favicon.ico"
+    );
 
     let exa = search_app
         .oneshot(
@@ -1414,7 +1653,10 @@ async fn moderations_rerank_and_search_endpoints_are_supported() {
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["provider"], "exa-search");
     assert_eq!(payload["results"][0]["title"], "Exa Rust");
-    assert_eq!(payload["results"][0]["content"]["text"], "exa full text body");
+    assert_eq!(
+        payload["results"][0]["content"]["text"],
+        "exa full text body"
+    );
     assert_eq!(payload["results"][0]["metadata"]["author"], "Exa Bot");
 }
 
@@ -1425,22 +1667,48 @@ async fn audio_endpoints_are_supported() {
     let state = setup_state().await;
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "speaker".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("speaker".to_string()), name: Some("Speech".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("speaker/tts-1".to_string()),
-        supported_endpoints: Some(vec!["audio.speech".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "speaker".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("speaker".to_string()),
+            name: Some("Speech".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("speaker/tts-1".to_string()),
+            supported_endpoints: Some(vec!["audio.speech".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
     state
         .repository
-        .create_provider_connection(kou_router::models::NewProviderConnection { provider: "scribe".to_string(), base_url: upstream.clone(), api_key: None, auth_type: "apikey".to_string(), auth_header: "bearer".to_string(), auth_prefix: None, extra_headers: BTreeMap::new(), endpoint_paths: None, stream_endpoint_paths: None, model_prefix: Some("scribe".to_string()), name: Some("Transcriptions".to_string()),
-        enabled: true,
-        priority: Some(0),
-        default_model: Some("scribe/whisper-1".to_string()),
-        supported_endpoints: Some(vec!["audio.transcriptions".to_string()]),
-        rate_limit_protection: false, protocol_format: None, })
+        .create_provider_connection(kou_router::models::NewProviderConnection {
+            provider: "scribe".to_string(),
+            base_url: upstream.clone(),
+            api_key: None,
+            auth_type: "apikey".to_string(),
+            auth_header: "bearer".to_string(),
+            auth_prefix: None,
+            extra_headers: BTreeMap::new(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some("scribe".to_string()),
+            name: Some("Transcriptions".to_string()),
+            enabled: true,
+            priority: Some(0),
+            default_model: Some("scribe/whisper-1".to_string()),
+            supported_endpoints: Some(vec!["audio.transcriptions".to_string()]),
+            rate_limit_protection: false,
+            protocol_format: None,
+        })
         .await
         .unwrap();
 
@@ -1502,12 +1770,17 @@ async fn audio_endpoints_are_supported() {
     assert_eq!(payload["_kou_router"]["endpoint"], "audio.transcriptions");
 
     let providers = state.repository.list_provider_connections().await.unwrap();
-    let speaker = providers.iter().find(|provider| provider.provider == "speaker").unwrap();
-    let scribe = providers.iter().find(|provider| provider.provider == "scribe").unwrap();
+    let speaker = providers
+        .iter()
+        .find(|provider| provider.provider == "speaker")
+        .unwrap();
+    let scribe = providers
+        .iter()
+        .find(|provider| provider.provider == "scribe")
+        .unwrap();
     assert_eq!(speaker.test_status.as_deref(), Some("ok"));
     assert_eq!(scribe.test_status.as_deref(), Some("ok"));
 }
-
 
 #[tokio::test]
 async fn provider_auth_headers_and_path_overrides_are_supported() {
@@ -1590,7 +1863,10 @@ async fn provider_auth_headers_and_path_overrides_are_supported() {
             auth_header: "x-api-key".to_string(),
             auth_prefix: None,
             extra_headers: BTreeMap::from([("x-trace-id".to_string(), "trace-123".to_string())]),
-            endpoint_paths: Some(BTreeMap::from([("messages".to_string(), "/custom/messages".to_string())])),
+            endpoint_paths: Some(BTreeMap::from([(
+                "messages".to_string(),
+                "/custom/messages".to_string(),
+            )])),
             stream_endpoint_paths: None,
             model_prefix: Some("anthro".to_string()),
             name: Some("Anthropic-style".to_string()),
@@ -1613,7 +1889,10 @@ async fn provider_auth_headers_and_path_overrides_are_supported() {
             auth_header: "x-api-key".to_string(),
             auth_prefix: None,
             extra_headers: BTreeMap::new(),
-            endpoint_paths: Some(BTreeMap::from([("search".to_string(), "/custom/search".to_string())])),
+            endpoint_paths: Some(BTreeMap::from([(
+                "search".to_string(),
+                "/custom/search".to_string(),
+            )])),
             stream_endpoint_paths: None,
             model_prefix: Some("searchx".to_string()),
             name: Some("Search Header".to_string()),
@@ -1676,7 +1955,10 @@ async fn provider_auth_headers_and_path_overrides_are_supported() {
     assert_eq!(messages.status(), StatusCode::OK);
     let body = messages.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["content"][0]["text"], "auth=anthropic-secret;trace=trace-123");
+    assert_eq!(
+        payload["content"][0]["text"],
+        "auth=anthropic-secret;trace=trace-123"
+    );
 
     let search = app
         .clone()
@@ -1721,7 +2003,10 @@ async fn provider_auth_headers_and_path_overrides_are_supported() {
         .await
         .unwrap();
     assert_eq!(stream.status(), StatusCode::OK);
-    assert_eq!(stream.headers().get("content-type").unwrap(), "text/event-stream");
+    assert_eq!(
+        stream.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
     let body = stream.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("override"));

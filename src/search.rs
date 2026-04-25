@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     error::{AppError, AppResult},
@@ -17,7 +17,11 @@ pub struct SearchRequestSpec {
     pub body: Option<Value>,
 }
 
-pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fallback_url: &str) -> AppResult<SearchRequestSpec> {
+pub fn build_search_request(
+    provider: &ProviderConnection,
+    payload: &Value,
+    fallback_url: &str,
+) -> AppResult<SearchRequestSpec> {
     let provider_id = provider.provider.as_str();
     let query = payload
         .get("query")
@@ -49,7 +53,11 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
 
     Ok(match provider_id {
         "serper-search" => {
-            let endpoint = if search_type == "news" { "/news" } else { "/search" };
+            let endpoint = if search_type == "news" {
+                "/news"
+            } else {
+                "/search"
+            };
             let mut body = json!({
                 "q": query,
                 "num": max_results,
@@ -77,10 +85,7 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
             } else {
                 "/res/v1/web/search"
             };
-            let mut qp = vec![
-                ("q", query.to_string()),
-                ("count", max_results.to_string()),
-            ];
+            let mut qp = vec![("q", query.to_string()), ("count", max_results.to_string())];
             if let Some(country) = country {
                 qp.push(("country", country.to_string()));
             }
@@ -89,7 +94,13 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
             }
             let query_string = qp
                 .into_iter()
-                .map(|(k, v)| format!("{}={}", encode_query_component(k), encode_query_component(&v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        encode_query_component(k),
+                        encode_query_component(&v)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("&");
             let base = if search_url_is_overridden(provider, fallback_url) {
@@ -112,10 +123,12 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
                 body["country"] = Value::String(country.to_string());
             }
             if let Some(language) = language {
-                body["search_language_filter"] = Value::Array(vec![Value::String(language.to_string())]);
+                body["search_language_filter"] =
+                    Value::Array(vec![Value::String(language.to_string())]);
             }
             if !domain_filter.is_empty() {
-                body["search_domain_filter"] = Value::Array(domain_filter.into_iter().map(Value::String).collect());
+                body["search_domain_filter"] =
+                    Value::Array(domain_filter.into_iter().map(Value::String).collect());
             }
             SearchRequestSpec {
                 method: SearchHttpMethod::Post,
@@ -133,10 +146,12 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
                 "highlights": true,
             });
             if !includes.is_empty() {
-                body["includeDomains"] = Value::Array(includes.into_iter().map(Value::String).collect());
+                body["includeDomains"] =
+                    Value::Array(includes.into_iter().map(Value::String).collect());
             }
             if !excludes.is_empty() {
-                body["excludeDomains"] = Value::Array(excludes.into_iter().map(Value::String).collect());
+                body["excludeDomains"] =
+                    Value::Array(excludes.into_iter().map(Value::String).collect());
             }
             if search_type == "news" {
                 body["category"] = Value::String("news".to_string());
@@ -155,10 +170,12 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
                 "topic": if search_type == "news" { "news" } else { "general" },
             });
             if !includes.is_empty() {
-                body["include_domains"] = Value::Array(includes.into_iter().map(Value::String).collect());
+                body["include_domains"] =
+                    Value::Array(includes.into_iter().map(Value::String).collect());
             }
             if !excludes.is_empty() {
-                body["exclude_domains"] = Value::Array(excludes.into_iter().map(Value::String).collect());
+                body["exclude_domains"] =
+                    Value::Array(excludes.into_iter().map(Value::String).collect());
             }
             if let Some(country) = country {
                 body["country"] = Value::String(country.to_string());
@@ -177,14 +194,22 @@ pub fn build_search_request(provider: &ProviderConnection, payload: &Value, fall
     })
 }
 
-pub fn normalize_search_response(provider_id: &str, query: &str, search_type: &str, raw: Value) -> Value {
+pub fn normalize_search_response(
+    provider_id: &str,
+    query: &str,
+    search_type: &str,
+    raw: Value,
+) -> Value {
     let results = match provider_id {
         "serper-search" => normalize_serper(&raw, search_type),
         "brave-search" => normalize_brave(&raw, search_type),
         "perplexity-search" => normalize_perplexity(&raw),
         "exa-search" => normalize_exa(&raw),
         "tavily-search" => normalize_tavily(&raw),
-        _ => raw.get("results").cloned().unwrap_or_else(|| Value::Array(vec![])),
+        _ => raw
+            .get("results")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![])),
     };
 
     let mut body = json!({
@@ -444,7 +469,6 @@ fn search_cost(provider_id: &str) -> f64 {
     }
 }
 
-
 fn encode_query_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -555,7 +579,8 @@ mod tests {
     fn test_build_perplexity_request() {
         let provider = make_search_provider("perplexity-search");
         let payload = json!({"query": "meaning of life", "max_results": 10});
-        let spec = build_search_request(&provider, &payload, "https://api.perplexity.test").unwrap();
+        let spec =
+            build_search_request(&provider, &payload, "https://api.perplexity.test").unwrap();
         assert!(matches!(spec.method, SearchHttpMethod::Post));
         let body = spec.body.unwrap();
         assert_eq!(body["query"], "meaning of life");

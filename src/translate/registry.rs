@@ -29,8 +29,7 @@ impl TranslatorRegistry {
 
     fn register_all(&mut self) {
         use super::{
-            claude_to_openai, gemini_to_openai, ollama, openai_to_claude, openai_to_gemini,
-            stream,
+            claude_to_openai, gemini_to_openai, ollama, openai_to_claude, openai_to_gemini, stream,
         };
 
         // OpenAI -> Claude

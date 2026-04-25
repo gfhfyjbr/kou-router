@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr, sync::Arc};
 
-use kou_router::{build_app, init_db, routes::AppState, SqliteRepository};
+use kou_router::{SqliteRepository, build_app, init_db, routes::AppState};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]

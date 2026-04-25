@@ -1,8 +1,8 @@
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use uuid::Uuid;
 
-use crate::error::{AppError, AppResult};
 use super::models::Claims;
+use crate::error::{AppError, AppResult};
 
 const JWT_EXPIRY_HOURS: i64 = 24;
 

@@ -1,8 +1,11 @@
-pub mod models;
-pub mod password;
 pub mod api_key;
 pub mod jwt;
 pub mod middleware;
+pub mod models;
+pub mod password;
 
-pub use models::{AuthContext, AuthStatus, ApiKeyRecord, ApiKeyCreated, CreateApiKeyRequest, LoginRequest, SetupRequest};
-pub use middleware::{ProxyAuth, ManagementAuth};
+pub use middleware::{ManagementAuth, ProxyAuth};
+pub use models::{
+    ApiKeyCreated, ApiKeyRecord, AuthContext, AuthStatus, CreateApiKeyRequest, LoginRequest,
+    SetupRequest,
+};

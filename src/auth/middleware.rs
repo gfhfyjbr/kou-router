@@ -30,11 +30,7 @@ async fn is_auth_required(state: &AppState) -> bool {
 }
 
 async fn get_jwt_secret(state: &AppState) -> Option<String> {
-    state
-        .repository
-        .get_setting_string("jwt_secret")
-        .await
-        .ok()
+    state.repository.get_setting_string("jwt_secret").await.ok()
 }
 
 fn extract_bearer_token(parts: &Parts) -> Option<String> {
@@ -48,7 +44,12 @@ fn extract_bearer_token(parts: &Parts) -> Option<String> {
 }
 
 fn extract_api_key_header(parts: &Parts) -> Option<String> {
-    parts.headers.get("x-api-key")?.to_str().ok().map(String::from)
+    parts
+        .headers
+        .get("x-api-key")?
+        .to_str()
+        .ok()
+        .map(String::from)
 }
 
 fn extract_jwt_cookie(parts: &Parts) -> Option<String> {

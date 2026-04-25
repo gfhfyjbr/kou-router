@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::AppResult;
@@ -76,10 +76,7 @@ pub fn translate_response_to_openai(body: &Value) -> AppResult<Value> {
         .get("prompt_eval_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let completion_tokens = body
-        .get("eval_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let completion_tokens = body.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let id = format!("chatcmpl-ollama-{}", Uuid::new_v4());
 
@@ -198,7 +195,9 @@ mod tests {
     fn test_request_no_options_if_empty() {
         let body = json!({ "messages": [] });
         let result = translate_request_to_ollama("llama3", &body, false).unwrap();
-        assert!(result.get("options").is_none(), "options key should be absent when no option fields set");
+        assert!(
+            result.get("options").is_none(),
+            "options key should be absent when no option fields set"
+        );
     }
-
 }

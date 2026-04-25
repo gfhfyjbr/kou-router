@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::Multipart,
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::Multipart,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use serde_json::Value;
 
@@ -13,7 +13,7 @@ use crate::{
     models::{AudioTranscriptionPayload, EndpointKind, RoutingDebug},
     repository::SqliteRepository,
     service::RouterService,
-    upstream::{fallback_error, AudioResponse, UpstreamClient},
+    upstream::{AudioResponse, UpstreamClient, fallback_error},
 };
 
 #[derive(Clone)]
@@ -31,10 +31,12 @@ impl AudioService {
     }
 
     pub async fn speech(&self, _router: &RouterService, payload: Value) -> AppResult<Response> {
-        let normalized = RouterService::new(self.repository.clone()).normalize_audio_speech(payload)?;
+        let normalized =
+            RouterService::new(self.repository.clone()).normalize_audio_speech(payload)?;
         let resolved_model = self.repository.resolve_alias(&normalized.model).await?;
         let providers = self.eligible_providers(EndpointKind::AudioSpeech).await?;
-        let (candidate, provider) = resolve_provider(&providers, &resolved_model, EndpointKind::AudioSpeech)?;
+        let (candidate, provider) =
+            resolve_provider(&providers, &resolved_model, EndpointKind::AudioSpeech)?;
         let (_, raw_model) = split_model(&candidate)?;
 
         let upstream = self
@@ -42,11 +44,14 @@ impl AudioService {
             .execute_audio_speech(&provider, &raw_model, &normalized.body)
             .await?;
         let debug = RoutingDebug {
+            request_id: uuid::Uuid::new_v4().to_string(),
             requested_model: normalized.model,
             resolved_model,
             endpoint: EndpointKind::AudioSpeech.as_str().to_string(),
             path_suffix: None,
             tried: vec![upstream.as_attempt(provider.id.clone(), candidate)],
+            usage: None,
+            cost_usd: None,
         };
 
         if (200..300).contains(&upstream.status.as_u16()) {
@@ -74,8 +79,11 @@ impl AudioService {
         let providers = self
             .eligible_providers(EndpointKind::AudioTranscriptions)
             .await?;
-        let (candidate, provider) =
-            resolve_provider(&providers, &resolved_model, EndpointKind::AudioTranscriptions)?;
+        let (candidate, provider) = resolve_provider(
+            &providers,
+            &resolved_model,
+            EndpointKind::AudioTranscriptions,
+        )?;
         let (_, raw_model) = split_model(&candidate)?;
 
         let upstream = self
@@ -91,11 +99,14 @@ impl AudioService {
                 map.insert(
                     "_kou_router".to_string(),
                     serde_json::to_value(RoutingDebug {
+                        request_id: uuid::Uuid::new_v4().to_string(),
                         requested_model,
                         resolved_model,
                         endpoint: EndpointKind::AudioTranscriptions.as_str().to_string(),
                         path_suffix: None,
                         tried: vec![attempt],
+                        usage: None,
+                        cost_usd: None,
                     })?,
                 );
             }
@@ -105,7 +116,8 @@ impl AudioService {
         self.repository
             .mark_provider_failure(&provider.id, &String::from_utf8_lossy(&upstream.bytes))
             .await?;
-        let should_fallback = fallback_error(upstream.status, &String::from_utf8_lossy(&upstream.bytes));
+        let should_fallback =
+            fallback_error(upstream.status, &String::from_utf8_lossy(&upstream.bytes));
         if should_fallback {
             return Err(AppError::Upstream(format!(
                 "audio transcriptions request failed for {} with fallback-worthy status {}",
@@ -174,7 +186,9 @@ fn resolve_provider(
         })
 }
 
-async fn collect_transcription_payload(mut multipart: Multipart) -> AppResult<AudioTranscriptionPayload> {
+async fn collect_transcription_payload(
+    mut multipart: Multipart,
+) -> AppResult<AudioTranscriptionPayload> {
     let mut model = None;
     let mut filename = None;
     let mut content_type = None;
@@ -194,14 +208,15 @@ async fn collect_transcription_payload(mut multipart: Multipart) -> AppResult<Au
                 field
                     .bytes()
                     .await
-                    .map_err(|err| AppError::BadRequest(format!("failed to read uploaded file: {err}")))?
+                    .map_err(|err| {
+                        AppError::BadRequest(format!("failed to read uploaded file: {err}"))
+                    })?
                     .to_vec(),
             );
         } else {
-            let value = field
-                .text()
-                .await
-                .map_err(|err| AppError::BadRequest(format!("failed to read multipart field {name}: {err}")))?;
+            let value = field.text().await.map_err(|err| {
+                AppError::BadRequest(format!("failed to read multipart field {name}: {err}"))
+            })?;
             if name == "model" {
                 model = Some(value.clone());
             }
@@ -231,8 +246,9 @@ fn build_audio_response(upstream: AudioResponse, debug: RoutingDebug) -> AppResu
     );
     headers.insert(
         "x-kou-router-debug",
-        HeaderValue::from_str(&serde_json::to_string(&debug)?)
-            .map_err(|err| AppError::BadRequest(format!("debug header too large/invalid: {err}")))?,
+        HeaderValue::from_str(&serde_json::to_string(&debug)?).map_err(|err| {
+            AppError::BadRequest(format!("debug header too large/invalid: {err}"))
+        })?,
     );
     Ok(response)
 }

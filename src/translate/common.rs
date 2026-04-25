@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Map OpenAI finish_reason to Claude stop_reason
 pub fn openai_finish_to_claude_stop(reason: &str) -> &str {
@@ -214,7 +214,6 @@ pub fn claude_tools_to_openai(tools: &Value) -> Value {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,10 +269,13 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
         ]);
         let result = openai_content_to_claude_blocks(&input);
-        assert_eq!(result, json!([
-            {"type": "text", "text": "hi"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
-        ]));
+        assert_eq!(
+            result,
+            json!([
+                {"type": "text", "text": "hi"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+            ])
+        );
     }
 
     #[test]
@@ -282,9 +284,12 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
         ]);
         let result = openai_content_to_claude_blocks(&input);
-        assert_eq!(result, json!([
-            {"type": "image", "source": {"type": "url", "url": "https://example.com/img.png"}}
-        ]));
+        assert_eq!(
+            result,
+            json!([
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/img.png"}}
+            ])
+        );
     }
 
     #[test]
@@ -316,12 +321,15 @@ mod tests {
             "function": {"name": "fn", "arguments": "{\"a\":1}"}
         }]);
         let result = openai_tool_calls_to_claude(&input);
-        assert_eq!(result, vec![json!({
-            "type": "tool_use",
-            "id": "1",
-            "name": "fn",
-            "input": {"a": 1}
-        })]);
+        assert_eq!(
+            result,
+            vec![json!({
+                "type": "tool_use",
+                "id": "1",
+                "name": "fn",
+                "input": {"a": 1}
+            })]
+        );
     }
 
     #[test]
@@ -337,7 +345,8 @@ mod tests {
         assert_eq!(result[0]["id"], "1");
         assert_eq!(result[0]["type"], "function");
         assert_eq!(result[0]["function"]["name"], "fn");
-        let args: Value = serde_json::from_str(result[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: Value =
+            serde_json::from_str(result[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args, json!({"a": 1}));
     }
 
@@ -352,11 +361,14 @@ mod tests {
             }
         }]);
         let result = openai_tools_to_claude(&input);
-        assert_eq!(result, json!([{
-            "name": "fn",
-            "description": "desc",
-            "input_schema": {"type": "object"}
-        }]));
+        assert_eq!(
+            result,
+            json!([{
+                "name": "fn",
+                "description": "desc",
+                "input_schema": {"type": "object"}
+            }])
+        );
     }
 
     #[test]
@@ -367,14 +379,17 @@ mod tests {
             "input_schema": {"type": "object"}
         }]);
         let result = claude_tools_to_openai(&input);
-        assert_eq!(result, json!([{
-            "type": "function",
-            "function": {
-                "name": "fn",
-                "description": "desc",
-                "parameters": {"type": "object"}
-            }
-        }]));
+        assert_eq!(
+            result,
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "fn",
+                    "description": "desc",
+                    "parameters": {"type": "object"}
+                }
+            }])
+        );
     }
 
     #[test]

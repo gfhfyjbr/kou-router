@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::common::*;
@@ -30,8 +30,7 @@ pub fn translate_response(body: &Value) -> AppResult<Value> {
                 let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let empty_obj = json!({});
                 let args = fc.get("args").unwrap_or(&empty_obj);
-                let args_str =
-                    serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
                 tool_calls.push(json!({
                     "id": format!("call_{}", Uuid::new_v4()),
                     "type": "function",
@@ -106,7 +105,6 @@ pub fn translate_response(body: &Value) -> AppResult<Value> {
     }))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,13 +143,16 @@ mod tests {
             }]
         });
         let result = translate_response(&body).unwrap();
-        let tool_calls = result["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        let tool_calls = result["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
         assert_eq!(tool_calls.len(), 1);
         let tc = &tool_calls[0];
         assert!(tc["id"].as_str().unwrap().starts_with("call_"));
         assert_eq!(tc["type"], "function");
         assert_eq!(tc["function"]["name"], "get_weather");
-        let args: serde_json::Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["location"], "NYC");
         // content should be null when only tool calls present
         assert!(result["choices"][0]["message"]["content"].is_null());
@@ -159,7 +160,11 @@ mod tests {
 
     #[test]
     fn test_finish_reason_mapping() {
-        let cases = [("STOP", "stop"), ("MAX_TOKENS", "length"), ("SAFETY", "content_filter")];
+        let cases = [
+            ("STOP", "stop"),
+            ("MAX_TOKENS", "length"),
+            ("SAFETY", "content_filter"),
+        ];
         for (gemini_reason, expected) in cases {
             let body = json!({
                 "candidates": [{

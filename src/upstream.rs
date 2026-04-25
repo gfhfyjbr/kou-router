@@ -1,15 +1,19 @@
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
-    header::{HeaderName, HeaderValue, AUTHORIZATION},
-    multipart, Client, Method, RequestBuilder, StatusCode,
+    Client, Method, RequestBuilder, StatusCode,
+    header::{AUTHORIZATION, HeaderName, HeaderValue},
+    multipart,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     error::AppResult,
-    models::{AudioTranscriptionPayload, EndpointKind, ProviderConnection, ProviderChatAttempt},
-    search::{build_search_request, normalize_search_response, SearchHttpMethod},
+    models::{
+        AudioTranscriptionPayload, EndpointKind, ProviderAccount, ProviderAccountAuthMode,
+        ProviderChatAttempt, ProviderConnection,
+    },
+    search::{SearchHttpMethod, build_search_request, normalize_search_response},
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -26,12 +30,21 @@ pub struct PassthroughHeaders {
 
 impl PassthroughHeaders {
     /// Extract passthrough headers from an incoming axum request's HeaderMap.
-    /// Captures: anthropic-beta, anthropic-version, x-client-request-id
+    /// Captures: anthropic-beta, anthropic-version, x-client-request-id, and Claude Code specific headers
     pub fn from_header_map(headers: &axum::http::HeaderMap) -> Self {
         const PASSTHROUGH_NAMES: &[&str] = &[
             "anthropic-beta",
             "anthropic-version",
+            "x-request-id",
             "x-client-request-id",
+            // Claude Code specific headers
+            "x-app",
+            "user-agent",
+            "x-claude-code-session-id",
+            "x-claude-remote-container-id",
+            "x-claude-remote-session-id",
+            "x-client-app",
+            "x-anthropic-additional-protection",
         ];
         let mut extracted = Vec::new();
         for &name in PASSTHROUGH_NAMES {
@@ -42,6 +55,20 @@ impl PassthroughHeaders {
             }
         }
         Self { headers: extracted }
+    }
+
+    /// Merge additional headers without overwriting existing ones.
+    /// Used by fingerprint injection to add Claude Code headers.
+    pub fn merge(&mut self, additional: Vec<(String, String)>) {
+        for (name, value) in additional {
+            if !self
+                .headers
+                .iter()
+                .any(|(n, _)| n.to_lowercase() == name.to_lowercase())
+            {
+                self.headers.push((name, value));
+            }
+        }
     }
 }
 
@@ -58,6 +85,7 @@ pub struct StreamingProviderResponse {
     pub provider_id: String,
     pub model: String,
     pub stream: BoxStream,
+    pub response_headers: Vec<(String, String)>,
 }
 
 pub fn tee_stream(
@@ -80,9 +108,148 @@ pub fn tee_stream(
     (Box::pin(teed), buffer)
 }
 
+/// Wrap a stream with idle timeout watchdog.
+/// If no data arrives within `idle_timeout`, the stream terminates with an SSE error event.
+pub fn watchdog_stream(
+    stream: BoxStream,
+    idle_timeout: std::time::Duration,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>> {
+    let stream = async_stream::stream! {
+        let mut inner = Box::pin(stream);
+        loop {
+            match tokio::time::timeout(idle_timeout, inner.next()).await {
+                Ok(Some(Ok(bytes))) => yield Ok(bytes),
+                Ok(Some(Err(e))) => {
+                    yield Err(Box::new(e) as BoxError);
+                    break;
+                }
+                Ok(None) => break, // stream ended naturally
+                Err(_timeout) => {
+                    // Idle timeout — send error SSE event and terminate
+                    let timeout_secs = idle_timeout.as_secs();
+                    let error_event = format!(
+                        "data: {{\"error\": {{\"message\": \"stream idle timeout after {}s\", \"type\": \"stream_timeout\"}}}}\n\n",
+                        timeout_secs
+                    );
+                    tracing::warn!(
+                        timeout_secs = timeout_secs,
+                        "SSE stream idle timeout, closing connection"
+                    );
+                    yield Ok(Bytes::from(error_event));
+                    break;
+                }
+            }
+        }
+    };
+    Box::pin(stream)
+}
+
+/// Like `tee_stream` but accepts `BoxError` streams (for use after watchdog).
+pub fn tee_stream_boxerror(
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
+) -> (
+    Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
+    Arc<Mutex<Vec<u8>>>,
+) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let buf_clone = buffer.clone();
+    let teed = stream.map(move |result| match result {
+        Ok(bytes) => {
+            if let Ok(mut buf) = buf_clone.lock() {
+                buf.extend_from_slice(&bytes);
+            }
+            Ok(bytes)
+        }
+        Err(e) => Err(e),
+    });
+    (Box::pin(teed), buffer)
+}
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: Client,
+}
+
+pub fn provider_with_account_auth(
+    provider: &ProviderConnection,
+    account: &ProviderAccount,
+    provider_id: &str,
+) -> ProviderConnection {
+    let mut resolved = provider.clone();
+    match account.auth_mode {
+        ProviderAccountAuthMode::ApiKey => {
+            resolved.api_key = account.api_key.clone();
+        }
+        ProviderAccountAuthMode::OAuth => {
+            resolved.api_key = account.access_token.clone();
+            if provider_id.eq_ignore_ascii_case("codex") {
+                resolved
+                    .extra_headers
+                    .entry("ChatGPT-Account-ID".to_string())
+                    .or_insert_with(|| account.remote_account_id.clone().unwrap_or_default());
+                if resolved
+                    .extra_headers
+                    .get("ChatGPT-Account-ID")
+                    .is_some_and(String::is_empty)
+                {
+                    resolved.extra_headers.remove("ChatGPT-Account-ID");
+                }
+            }
+        }
+    }
+    resolved
+}
+
+fn is_codex_responses_provider(provider: &ProviderConnection) -> bool {
+    provider.provider.eq_ignore_ascii_case("codex")
+        || provider.model_prefix.eq_ignore_ascii_case("codex")
+        || provider.base_url.contains("/backend-api/codex")
+}
+
+fn force_codex_responses_stream(
+    provider: &ProviderConnection,
+    endpoint: EndpointKind,
+    request_body: &mut Value,
+ ) {
+    if endpoint != EndpointKind::Responses || !is_codex_responses_provider(provider) {
+        return;
+    }
+    if let Some(object) = request_body.as_object_mut() {
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedUpstreamRequest {
+    pub request_body: Value,
+    pub path: String,
+    pub url: String,
+}
+
+pub fn prepare_upstream_request(
+    provider: &ProviderConnection,
+    endpoint: EndpointKind,
+    suffix: Option<&str>,
+    model: &str,
+    payload: &Value,
+    inject_model: bool,
+) -> PreparedUpstreamRequest {
+    let mut request_body = payload.clone();
+    if inject_model {
+        request_body["model"] = Value::String(model.to_string());
+    }
+    force_codex_responses_stream(provider, endpoint, &mut request_body);
+    let stream_requested = request_body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let path = endpoint_path(provider, endpoint, suffix, stream_requested);
+    let url = build_url(&provider.base_url, &path);
+    PreparedUpstreamRequest {
+        request_body,
+        path,
+        url,
+    }
 }
 
 impl UpstreamClient {
@@ -90,6 +257,41 @@ impl UpstreamClient {
         Self {
             client: Client::new(),
         }
+    }
+
+    /// Extract response headers that should be forwarded back to the client.
+    /// Captures rate-limit headers, retry-after, and request-id from upstream.
+    fn extract_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+        const FORWARD_PREFIXES: &[&str] = &["anthropic-ratelimit-", "x-ratelimit-"];
+        const FORWARD_EXACT: &[&str] = &["retry-after", "request-id", "x-request-id"];
+        let mut result = Vec::new();
+        for (name, value) in headers.iter() {
+            let n = name.as_str();
+            let matched =
+                FORWARD_EXACT.contains(&n) || FORWARD_PREFIXES.iter().any(|p| n.starts_with(p));
+            if matched {
+                if let Ok(v) = value.to_str() {
+                    result.push((n.to_string(), v.to_string()));
+                }
+            }
+        }
+        result
+    }
+
+    fn is_streaming_response(endpoint: EndpointKind, content_type: Option<&str>) -> bool {
+        let Some(content_type) = content_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let content_type = content_type.to_ascii_lowercase();
+        if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
+            return true;
+        }
+        endpoint == EndpointKind::Responses
+            && !content_type.contains("application/json")
+            && !content_type.contains("application/problem+json")
     }
 
     pub async fn execute(
@@ -102,19 +304,29 @@ impl UpstreamClient {
         inject_model: bool,
         passthrough_headers: Option<&PassthroughHeaders>,
     ) -> AppResult<UpstreamResult> {
-        let stream_requested = payload
-            .get("stream")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let path = endpoint_path(provider, endpoint, suffix, stream_requested);
-        let url = build_url(&provider.base_url, &path);
-        let mut request_body = payload.clone();
-        if inject_model {
-            request_body["model"] = Value::String(model.to_string());
-        }
+        let prepared = prepare_upstream_request(
+            provider,
+            endpoint,
+            suffix,
+            model,
+            payload,
+            inject_model,
+        );
+        self.execute_prepared(provider, endpoint, model, &prepared, passthrough_headers)
+            .await
+    }
 
+    pub async fn execute_prepared(
+        &self,
+        provider: &ProviderConnection,
+        endpoint: EndpointKind,
+        model: &str,
+        prepared: &PreparedUpstreamRequest,
+        passthrough_headers: Option<&PassthroughHeaders>,
+    ) -> AppResult<UpstreamResult> {
+        let request_body = &prepared.request_body;
         if endpoint == EndpointKind::Search {
-            let spec = build_search_request(provider, &request_body, &url)?;
+            let spec = build_search_request(provider, request_body, &prepared.url)?;
             let builder = match spec.method {
                 SearchHttpMethod::Get => self.client.request(Method::GET, spec.url),
                 SearchHttpMethod::Post => {
@@ -129,6 +341,7 @@ impl UpstreamClient {
             let builder = apply_passthrough_headers(builder, passthrough_headers);
             let response = apply_provider_headers(builder, provider).send().await?;
             let status = response.status();
+            let resp_headers = Self::extract_response_headers(response.headers());
             let body = response.text().await?;
             let body = if (200..300).contains(&status.as_u16()) {
                 let query = request_body
@@ -141,7 +354,12 @@ impl UpstreamClient {
                     .and_then(|value| value.as_str())
                     .unwrap_or("web");
                 let json_body: Value = serde_json::from_str(&body)?;
-                serde_json::to_string(&normalize_search_response(&provider.provider, query, search_type, json_body))?
+                serde_json::to_string(&normalize_search_response(
+                    &provider.provider,
+                    query,
+                    search_type,
+                    json_body,
+                ))?
             } else {
                 body
             };
@@ -149,29 +367,31 @@ impl UpstreamClient {
                 status,
                 body,
                 is_stream: false,
+                response_headers: resp_headers,
             }))
         } else {
-            let builder = self.client.request(Method::POST, url).json(&request_body);
+            let builder = self.client.request(Method::POST, &prepared.url).json(request_body);
             let builder = apply_passthrough_headers(builder, passthrough_headers);
             let response = apply_provider_headers(builder, provider).send().await?;
             let status = response.status();
-            let is_stream = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.contains("text/event-stream"))
-                .unwrap_or(false);
+            let is_stream = Self::is_streaming_response(
+                endpoint,
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let resp_headers = Self::extract_response_headers(response.headers());
 
             if is_stream && status.is_success() {
-                // True streaming — relay chunks directly to client
                 Ok(UpstreamResult::Streaming(StreamingProviderResponse {
                     status,
                     provider_id: provider.id.clone(),
                     model: model.to_string(),
                     stream: Box::pin(response.bytes_stream()),
+                    response_headers: resp_headers,
                 }))
             } else if is_stream {
-                // Error response on stream request — buffer all chunks
                 let mut stream = response.bytes_stream();
                 let mut body = String::new();
                 while let Some(chunk) = stream.next().await {
@@ -182,6 +402,7 @@ impl UpstreamClient {
                     status,
                     body,
                     is_stream: true,
+                    response_headers: resp_headers,
                 }))
             } else {
                 let body = response.text().await?;
@@ -189,9 +410,30 @@ impl UpstreamClient {
                     status,
                     body,
                     is_stream: false,
+                    response_headers: resp_headers,
                 }))
             }
         }
+    }
+
+    /// Raw proxy: send a JSON POST to an arbitrary path on the provider's base_url.
+    /// Returns (status, response_headers, body_string). Used for passthrough endpoints
+    /// like /v1/messages/count_tokens.
+    pub async fn execute_raw_proxy(
+        &self,
+        provider: &ProviderConnection,
+        path: &str,
+        payload: &Value,
+        passthrough_headers: Option<&PassthroughHeaders>,
+    ) -> AppResult<(StatusCode, Vec<(String, String)>, String)> {
+        let url = build_url(&provider.base_url, path);
+        let builder = self.client.request(Method::POST, url).json(payload);
+        let builder = apply_passthrough_headers(builder, passthrough_headers);
+        let response = apply_provider_headers(builder, provider).send().await?;
+        let status = response.status();
+        let resp_headers = Self::extract_response_headers(response.headers());
+        let body = response.text().await?;
+        Ok((status, resp_headers, body))
     }
 
     pub async fn execute_audio_speech(
@@ -234,7 +476,12 @@ impl UpstreamClient {
 
         let file_part = multipart::Part::bytes(payload.bytes.clone())
             .file_name(payload.filename.clone())
-            .mime_str(payload.content_type.as_deref().unwrap_or("application/octet-stream"))?;
+            .mime_str(
+                payload
+                    .content_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+            )?;
         let mut form = multipart::Form::new()
             .part("file", file_part)
             .text("model", model.to_string());
@@ -267,6 +514,7 @@ pub struct ProviderResponse {
     pub status: StatusCode,
     pub body: String,
     pub is_stream: bool,
+    pub response_headers: Vec<(String, String)>,
 }
 
 impl ProviderResponse {
@@ -276,6 +524,7 @@ impl ProviderResponse {
             model,
             status: self.status.as_u16(),
             body: self.body,
+            account: None,
         }
     }
 }
@@ -293,11 +542,15 @@ impl AudioResponse {
             model,
             status: self.status.as_u16(),
             body: self.body_preview(),
+            account: None,
         }
     }
 
     pub fn body_preview(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).chars().take(4000).collect()
+        String::from_utf8_lossy(&self.bytes)
+            .chars()
+            .take(4000)
+            .collect()
     }
 }
 
@@ -317,7 +570,10 @@ pub fn openai_error(message: &str) -> Value {
     })
 }
 
-fn apply_passthrough_headers(mut builder: RequestBuilder, headers: Option<&PassthroughHeaders>) -> RequestBuilder {
+fn apply_passthrough_headers(
+    mut builder: RequestBuilder,
+    headers: Option<&PassthroughHeaders>,
+) -> RequestBuilder {
     if let Some(pt) = headers {
         for (name, value) in &pt.headers {
             if let (Ok(hn), Ok(hv)) = (
@@ -331,7 +587,10 @@ fn apply_passthrough_headers(mut builder: RequestBuilder, headers: Option<&Passt
     builder
 }
 
-fn apply_provider_headers(mut builder: RequestBuilder, provider: &ProviderConnection) -> RequestBuilder {
+fn apply_provider_headers(
+    mut builder: RequestBuilder,
+    provider: &ProviderConnection,
+) -> RequestBuilder {
     if let Some(api_key) = &provider.api_key {
         let header = provider.auth_header.trim().to_ascii_lowercase();
         match header.as_str() {
@@ -384,7 +643,9 @@ fn endpoint_path(
     stream_requested: bool,
 ) -> String {
     if stream_requested {
-        if let Some(path) = provider_path_override(&provider.stream_endpoint_paths, endpoint, suffix) {
+        if let Some(path) =
+            provider_path_override(&provider.stream_endpoint_paths, endpoint, suffix)
+        {
             return path;
         }
     }
@@ -393,7 +654,9 @@ fn endpoint_path(
     }
 
     let default_path = match endpoint {
-        EndpointKind::ChatCompletions | EndpointKind::Completions => "/chat/completions".to_string(),
+        EndpointKind::ChatCompletions | EndpointKind::Completions => {
+            "/chat/completions".to_string()
+        }
         EndpointKind::Messages => "/messages".to_string(),
         EndpointKind::Responses => "/responses".to_string(),
         EndpointKind::OllamaChat => "/api/chat".to_string(),
@@ -415,9 +678,13 @@ fn provider_path_override(
     endpoint: EndpointKind,
     suffix: Option<&str>,
 ) -> Option<String> {
-    for key in [Some(endpoint.as_str()), Some(endpoint.capability()), chat_family_override_key(endpoint)]
-        .into_iter()
-        .flatten()
+    for key in [
+        Some(endpoint.as_str()),
+        Some(endpoint.capability()),
+        chat_family_override_key(endpoint),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(path) = overrides.get(key) {
             return Some(append_suffix_if_needed(endpoint, path.clone(), suffix));
@@ -434,7 +701,11 @@ fn chat_family_override_key(endpoint: EndpointKind) -> Option<&'static str> {
     }
 }
 
-fn append_suffix_if_needed(endpoint: EndpointKind, base_path: String, suffix: Option<&str>) -> String {
+fn append_suffix_if_needed(
+    endpoint: EndpointKind,
+    base_path: String,
+    suffix: Option<&str>,
+) -> String {
     if endpoint == EndpointKind::Responses {
         return if base_path.contains("{suffix}") {
             base_path.replace("{suffix}", suffix.unwrap_or(""))
@@ -444,7 +715,6 @@ fn append_suffix_if_needed(endpoint: EndpointKind, base_path: String, suffix: Op
     }
     base_path
 }
-
 
 fn append_path_suffix(base_path: &str, suffix: &str) -> String {
     if suffix.is_empty() {
@@ -468,9 +738,9 @@ fn build_url(base_url: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::EndpointKind;
     #[allow(unused_imports)]
     use serde_json::json;
-    use crate::models::EndpointKind;
     use std::collections::BTreeMap;
 
     fn make_provider() -> crate::models::ProviderConnection {
@@ -511,19 +781,28 @@ mod tests {
     #[test]
     fn test_endpoint_path_chat_default() {
         let p = make_provider();
-        assert_eq!(endpoint_path(&p, EndpointKind::ChatCompletions, None, false), "/chat/completions");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::ChatCompletions, None, false),
+            "/chat/completions"
+        );
     }
 
     #[test]
     fn test_endpoint_path_embeddings_default() {
         let p = make_provider();
-        assert_eq!(endpoint_path(&p, EndpointKind::Embeddings, None, false), "/embeddings");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::Embeddings, None, false),
+            "/embeddings"
+        );
     }
 
     #[test]
     fn test_endpoint_path_messages_default() {
         let p = make_provider();
-        assert_eq!(endpoint_path(&p, EndpointKind::Messages, None, false), "/messages");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::Messages, None, false),
+            "/messages"
+        );
     }
 
     #[test]
@@ -546,51 +825,127 @@ mod tests {
             (EndpointKind::AudioTranscriptions, "/audio/transcriptions"),
         ];
         for (kind, expected) in cases {
-            assert_eq!(endpoint_path(&p, kind, None, false), expected, "failed for {:?}", kind);
+            assert_eq!(
+                endpoint_path(&p, kind, None, false),
+                expected,
+                "failed for {:?}",
+                kind
+            );
         }
     }
 
     #[test]
     fn test_endpoint_path_override() {
         let mut p = make_provider();
-        p.endpoint_paths.insert("chat.completions".to_string(), "/v1/custom".to_string());
-        assert_eq!(endpoint_path(&p, EndpointKind::ChatCompletions, None, false), "/v1/custom");
+        p.endpoint_paths
+            .insert("chat.completions".to_string(), "/v1/custom".to_string());
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::ChatCompletions, None, false),
+            "/v1/custom"
+        );
     }
 
     #[test]
     fn test_endpoint_path_stream_override() {
         let mut p = make_provider();
-        p.stream_endpoint_paths.insert("chat.completions".to_string(), "/v1/stream-chat".to_string());
+        p.stream_endpoint_paths.insert(
+            "chat.completions".to_string(),
+            "/v1/stream-chat".to_string(),
+        );
         // stream_requested=true should use the stream override
-        assert_eq!(endpoint_path(&p, EndpointKind::ChatCompletions, None, true), "/v1/stream-chat");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::ChatCompletions, None, true),
+            "/v1/stream-chat"
+        );
         // stream_requested=false should fall through to default
-        assert_eq!(endpoint_path(&p, EndpointKind::ChatCompletions, None, false), "/chat/completions");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::ChatCompletions, None, false),
+            "/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_force_codex_responses_stream_overrides_non_stream_request() {
+        let mut provider = make_provider();
+        provider.provider = "codex".to_string();
+        provider.model_prefix = "codex".to_string();
+        provider.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+
+        let mut body = serde_json::json!({
+            "model": "codex/gpt-5.5",
+            "stream": false
+        });
+
+        force_codex_responses_stream(&provider, EndpointKind::Responses, &mut body);
+
+        assert_eq!(body["stream"], serde_json::json!(true));
     }
 
     #[test]
     fn test_endpoint_path_responses_suffix() {
         let p = make_provider();
-        assert_eq!(endpoint_path(&p, EndpointKind::Responses, Some("native/path"), false), "/responses/native/path");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::Responses, Some("native/path"), false),
+            "/responses/native/path"
+        );
     }
 
     #[test]
     fn test_endpoint_path_responses_placeholder_suffix() {
         let mut p = make_provider();
-        p.endpoint_paths.insert("responses".to_string(), "/v1/responses/{suffix}".to_string());
-        assert_eq!(endpoint_path(&p, EndpointKind::Responses, Some("abc"), false), "/v1/responses/abc");
+        p.endpoint_paths.insert(
+            "responses".to_string(),
+            "/v1/responses/{suffix}".to_string(),
+        );
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::Responses, Some("abc"), false),
+            "/v1/responses/abc"
+        );
         // Empty suffix replaces placeholder with empty string
-        assert_eq!(endpoint_path(&p, EndpointKind::Responses, None, false), "/v1/responses/");
+        assert_eq!(
+            endpoint_path(&p, EndpointKind::Responses, None, false),
+            "/v1/responses/"
+        );
     }
 
     #[test]
     fn test_build_url_relative() {
-        assert_eq!(build_url("https://api.test.com", "/chat/completions"), "https://api.test.com/chat/completions");
+        assert_eq!(
+            build_url("https://api.test.com", "/chat/completions"),
+            "https://api.test.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_is_streaming_response_accepts_responses_octet_stream() {
+        assert!(UpstreamClient::is_streaming_response(
+            EndpointKind::Responses,
+            Some("application/octet-stream"),
+        ));
+        assert!(!UpstreamClient::is_streaming_response(
+            EndpointKind::ChatCompletions,
+            Some("application/octet-stream"),
+        ));
+    }
+
+    #[test]
+    fn test_is_streaming_response_rejects_json() {
+        assert!(!UpstreamClient::is_streaming_response(
+            EndpointKind::Responses,
+            Some("application/json; charset=utf-8"),
+        ));
     }
 
     #[test]
     fn test_build_url_absolute() {
-        assert_eq!(build_url("https://api.test.com", "http://other.com/path"), "http://other.com/path");
-        assert_eq!(build_url("https://api.test.com", "https://other.com/path"), "https://other.com/path");
+        assert_eq!(
+            build_url("https://api.test.com", "http://other.com/path"),
+            "http://other.com/path"
+        );
+        assert_eq!(
+            build_url("https://api.test.com", "https://other.com/path"),
+            "https://other.com/path"
+        );
     }
 
     #[test]
@@ -610,17 +965,26 @@ mod tests {
 
     #[test]
     fn test_fallback_error_rate_limit_body() {
-        assert!(fallback_error(StatusCode::BAD_REQUEST, "Hit rate limit on this endpoint"));
+        assert!(fallback_error(
+            StatusCode::BAD_REQUEST,
+            "Hit rate limit on this endpoint"
+        ));
     }
 
     #[test]
     fn test_fallback_error_quota_body() {
-        assert!(fallback_error(StatusCode::BAD_REQUEST, "You have exceeded your quota"));
+        assert!(fallback_error(
+            StatusCode::BAD_REQUEST,
+            "You have exceeded your quota"
+        ));
     }
 
     #[test]
     fn test_fallback_error_400() {
-        assert!(!fallback_error(StatusCode::BAD_REQUEST, "invalid request body"));
+        assert!(!fallback_error(
+            StatusCode::BAD_REQUEST,
+            "invalid request body"
+        ));
     }
 
     #[test]

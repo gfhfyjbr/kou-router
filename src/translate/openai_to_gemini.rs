@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::{AppError, AppResult};
 
@@ -56,10 +56,8 @@ pub fn translate_request(_model: &str, body: &Value, _stream: bool) -> AppResult
                 let part = tool_msg_to_function_response(msg);
 
                 // Gemini requires consecutive function responses in a single message.
-                let merge = contents
-                    .last()
-                    .and_then(|c| c.get("role")?.as_str())
-                    == Some("function");
+                let merge =
+                    contents.last().and_then(|c| c.get("role")?.as_str()) == Some("function");
 
                 if merge {
                     // Safe: we just confirmed `last()` exists and has "parts".
@@ -152,21 +150,19 @@ fn openai_content_to_gemini_parts(content: &Value) -> Vec<Value> {
         Value::String(text) => vec![json!({ "text": text })],
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| {
-                match item.get("type")?.as_str()? {
-                    "text" => {
-                        let t = item.get("text").and_then(Value::as_str).unwrap_or("");
-                        Some(json!({ "text": t }))
-                    }
-                    "image_url" => {
-                        let url = item
-                            .get("image_url")
-                            .and_then(|v| v.get("url"))
-                            .and_then(Value::as_str)?;
-                        image_url_to_gemini_part(url)
-                    }
-                    _ => None,
+            .filter_map(|item| match item.get("type")?.as_str()? {
+                "text" => {
+                    let t = item.get("text").and_then(Value::as_str).unwrap_or("");
+                    Some(json!({ "text": t }))
                 }
+                "image_url" => {
+                    let url = item
+                        .get("image_url")
+                        .and_then(|v| v.get("url"))
+                        .and_then(Value::as_str)?;
+                    image_url_to_gemini_part(url)
+                }
+                _ => None,
             })
             .collect(),
         Value::Null => vec![json!({ "text": "" })],
@@ -195,22 +191,21 @@ fn image_url_to_gemini_part(url: &str) -> Option<Value> {
 fn tool_call_to_function_call(call: &Value) -> Option<Value> {
     let func = call.get("function")?;
     let name = func.get("name")?.as_str()?;
-    let args_str = func.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+    let args_str = func
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
     let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
     Some(json!({ "functionCall": { "name": name, "args": args } }))
 }
 
 /// Convert an OpenAI tool-role message to a Gemini functionResponse part.
 fn tool_msg_to_function_response(msg: &Value) -> Value {
-    let name = msg
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let name = msg.get("name").and_then(Value::as_str).unwrap_or("unknown");
     let raw = msg.get("content").and_then(Value::as_str).unwrap_or("{}");
     // Gemini expects a JSON object as the response body.
     // If the content isn't valid JSON, wrap the raw string so it's always an object.
-    let response: Value =
-        serde_json::from_str(raw).unwrap_or_else(|_| json!({ "result": raw }));
+    let response: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({ "result": raw }));
     json!({ "functionResponse": { "name": name, "response": response } })
 }
 
@@ -269,7 +264,6 @@ fn build_generation_config(body: &Value) -> Value {
 
     cfg
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -380,10 +374,7 @@ mod tests {
             "tool_choice": "required"
         });
         let result = translate_request("gemini-pro", &body, false).unwrap();
-        assert_eq!(
-            result["toolConfig"]["functionCallingConfig"]["mode"],
-            "ANY"
-        );
+        assert_eq!(result["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 
     #[test]

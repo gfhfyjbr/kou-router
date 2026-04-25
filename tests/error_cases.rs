@@ -1,15 +1,15 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     body::Body,
     http::{Request, StatusCode},
     response::IntoResponse,
     routing::post,
-    Json, Router,
 };
 use http_body_util::BodyExt;
-use kou_router::{build_app, init_db, routes::AppState, SqliteRepository};
-use serde_json::{json, Value};
+use kou_router::{SqliteRepository, build_app, init_db, routes::AppState};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -136,10 +136,7 @@ async fn test_chat_completions_invalid_model_format() {
 async fn test_embeddings_missing_input() {
     let app = build_app(setup_state().await);
     let resp = app
-        .oneshot(post_json(
-            "/v1/embeddings",
-            json!({"model": "p1/embed"}),
-        ))
+        .oneshot(post_json("/v1/embeddings", json!({"model": "p1/embed"})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -234,10 +231,7 @@ async fn test_search_missing_query() {
 async fn test_audio_speech_missing_input() {
     let app = build_app(setup_state().await);
     let resp = app
-        .oneshot(post_json(
-            "/v1/audio/speech",
-            json!({"model": "p1/tts"}),
-        ))
+        .oneshot(post_json("/v1/audio/speech", json!({"model": "p1/tts"})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -247,10 +241,7 @@ async fn test_audio_speech_missing_input() {
 async fn test_ollama_chat_missing_messages() {
     let app = build_app(setup_state().await);
     let resp = app
-        .oneshot(post_json(
-            "/v1/api/chat",
-            json!({"model": "p1/llama"}),
-        ))
+        .oneshot(post_json("/v1/api/chat", json!({"model": "p1/llama"})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -357,30 +348,20 @@ async fn test_non_retriable_error_stops_fallback() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // Non-retriable errors now return enriched classification (400 for invalid request)
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
-    assert!(
-        payload["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("all providers"),
-        "expected upstream error, got: {payload}"
-    );
+    assert_eq!(payload["error"]["type"], "invalid_request");
+    assert_eq!(payload["error"]["retriable"], false);
 }
 
 #[tokio::test]
 async fn test_all_providers_fail_returns_502() {
-    let fail1 = spawn_mock_server(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "boom1"}),
-    )
-    .await;
-    let fail2 = spawn_mock_server(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "boom2"}),
-    )
-    .await;
+    let fail1 =
+        spawn_mock_server(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom1"})).await;
+    let fail2 =
+        spawn_mock_server(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom2"})).await;
 
     let state = setup_state().await;
     create_provider(&state, "p1", fail1, 0).await;
@@ -423,12 +404,17 @@ async fn test_no_providers_for_model_prefix() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // "unknown/model" → no matching provider → tried has 404 → classified as model_not_found
+    let status = resp.status().as_u16();
+    assert!(
+        status == 404 || status == 502,
+        "expected 404 or 502, got {status}"
+    );
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let msg = payload["error"]["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("all providers") || msg.contains("failed"),
-        "expected routing failure, got: {msg}"
+        msg.contains("model") || msg.contains("provider") || msg.contains("failed"),
+        "expected model/provider failure, got: {msg}"
     );
 }

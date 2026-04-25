@@ -206,7 +206,13 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             &[],
             &[],
             &[],
-            &["chat", "rerank", "embeddings", "audio.speech", "audio.transcriptions"],
+            &[
+                "chat",
+                "rerank",
+                "embeddings",
+                "audio.speech",
+                "audio.transcriptions",
+            ],
             Some("nvidia/meta/llama-3.1-70b-instruct"),
             "Сводный NVIDIA preset по OmniRoute registries.",
         ),
@@ -218,7 +224,10 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             "bearer",
             None,
             &[],
-            &[("images.generations", "https://api.tokenfactory.nebius.com/v1/images/generations")],
+            &[(
+                "images.generations",
+                "https://api.tokenfactory.nebius.com/v1/images/generations",
+            )],
             &[],
             &["chat", "embeddings", "images", "rerank"],
             Some("nebius/meta-llama/Meta-Llama-3.1-70B-Instruct"),
@@ -233,8 +242,14 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             None,
             &[],
             &[
-                ("images.generations", "https://api.hyperbolic.xyz/v1/image/generation"),
-                ("audio.speech", "https://api.hyperbolic.xyz/v1/audio/generation"),
+                (
+                    "images.generations",
+                    "https://api.hyperbolic.xyz/v1/image/generation",
+                ),
+                (
+                    "audio.speech",
+                    "https://api.hyperbolic.xyz/v1/audio/generation",
+                ),
             ],
             &[],
             &["chat", "images", "audio.speech"],
@@ -250,8 +265,14 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             None,
             &[],
             &[
-                ("audio.transcriptions", "https://api-inference.huggingface.co/models"),
-                ("audio.speech", "https://api-inference.huggingface.co/models"),
+                (
+                    "audio.transcriptions",
+                    "https://api-inference.huggingface.co/models",
+                ),
+                (
+                    "audio.speech",
+                    "https://api-inference.huggingface.co/models",
+                ),
             ],
             &[],
             &["chat", "audio.speech", "audio.transcriptions"],
@@ -428,7 +449,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         ),
         preset(
             "claude-oauth",
-            "Claude OAuth Scaffold",
+            "Claude OAuth",
             "https://api.anthropic.com/v1",
             "oauth",
             "x-api-key",
@@ -444,7 +465,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             &[],
             &["messages"],
             Some("claude-oauth/claude-sonnet-4.6"),
-            "OmniRoute OAuth preset. Token exchange/refresh в Rust ещё не перенесён, но provider scaffold уже есть.",
+            "Claude Code OAuth preset with native authorization-code exchange and refresh support for managed provider accounts.",
         ),
         preset(
             "antigravity",
@@ -454,25 +475,41 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             "bearer",
             Some("Bearer"),
             &[],
-            &[("chat", "https://cloudcode-pa.googleapis.com/v1internal:generateContent")],
-            &[("chat", "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")],
+            &[(
+                "chat",
+                "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            )],
+            &[(
+                "chat",
+                "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+            )],
             &["chat"],
             Some("antigravity/gemini-3.1-pro-high"),
             "OmniRoute Antigravity scaffold. Требует OAuth/token-refresh и Gemini-style body translator для полной parity.",
         ),
         preset(
             "codex",
-            "Codex OAuth Scaffold",
+            "Codex OAuth",
             "https://chatgpt.com/backend-api/codex",
             "oauth",
             "bearer",
             Some("Bearer"),
-            &[("Openai-Beta", "responses=experimental"), ("Version", "0.92.0")],
-            &[("responses", "https://chatgpt.com/backend-api/codex/responses")],
+            &[
+                ("Openai-Beta", "responses=experimental"),
+                ("Version", "0.124.0"),
+                (
+                    "User-Agent",
+                    "codex_cli_rs/0.124.0 (Mac OS; arm64) ghostty/1.3.1",
+                ),
+            ],
+            &[(
+                "responses",
+                "https://chatgpt.com/backend-api/codex/responses",
+            )],
             &[],
             &["responses"],
             Some("codex/gpt-5.3-codex"),
-            "Codex scaffold из OmniRoute. Нужен native responses passthrough и OAuth exchange.",
+            "Codex OAuth preset for managed ChatGPT-backed accounts using the native Codex responses endpoint and OAuth refresh flow.",
         ),
         preset(
             "github-copilot",
@@ -505,7 +542,9 @@ pub fn find_provider_preset(id: &str) -> Option<ProviderPreset> {
         .find(|preset| preset.id.eq_ignore_ascii_case(id))
 }
 
-pub fn import_request_to_provider(input: ImportProviderPresetRequest) -> AppResult<NewProviderConnection> {
+pub fn import_request_to_provider(
+    input: ImportProviderPresetRequest,
+) -> AppResult<NewProviderConnection> {
     let preset = find_provider_preset(&input.preset_id)
         .ok_or_else(|| AppError::NotFound(format!("provider preset {}", input.preset_id)))?;
 
@@ -554,7 +593,10 @@ fn preset(
         extra_headers: map_from_pairs(extra_headers),
         endpoint_paths: map_from_pairs(endpoint_paths),
         stream_endpoint_paths: map_from_pairs(stream_endpoint_paths),
-        supported_endpoints: supported_endpoints.iter().map(|value| value.to_string()).collect(),
+        supported_endpoints: supported_endpoints
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
         default_model: default_model.map(ToString::to_string),
         source: "diegosouzapw/OmniRoute".to_string(),
         notes: notes.to_string(),
@@ -570,9 +612,23 @@ fn map_from_pairs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn detect_preset_protocol(preset_id: &str) -> Option<String> {
     match preset_id {
-        "anthropic" => Some("claude".to_string()),
+        "anthropic" | "claude-oauth" => Some("claude".to_string()),
+        "codex" => Some("openai-responses".to_string()),
         "vertex" => Some("gemini".to_string()),
         "ollama" => Some("ollama".to_string()),
         _ => None, // default: OpenAI-compatible
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_preset_protocol;
+
+    #[test]
+    fn test_detect_preset_protocol_codex_responses() {
+        assert_eq!(
+            detect_preset_protocol("codex"),
+            Some("openai-responses".to_string())
+        );
     }
 }

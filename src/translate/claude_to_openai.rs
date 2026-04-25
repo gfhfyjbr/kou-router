@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::common::*;
 use crate::error::AppResult;
@@ -68,20 +68,14 @@ pub fn translate_response(body: &Value) -> AppResult<Value> {
         .unwrap_or(0);
 
     // id — prefix with chatcmpl- if not already prefixed.
-    let raw_id = body
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let raw_id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let id = if raw_id.starts_with("chatcmpl-") {
         raw_id.to_string()
     } else {
         format!("chatcmpl-{raw_id}")
     };
 
-    let model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
     Ok(json!({
         "id": id,
