@@ -53,14 +53,38 @@ cargo run --release
 
 ### Переменные окружения
 
+**Базовые:**
+
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `KOU_ROUTER_BIND` | `0.0.0.0:20128` | host:port, на котором слушает axum |
 | `KOU_ROUTER_DATABASE_URL` | `sqlite://kou-router.db` | SQLite DSN |
 | `RUST_LOG` / `EnvFilter` | `kou_router=info,tower_http=info` | tracing-фильтр |
-| `KOU_CC_FINGERPRINT` | `0` | Включить fingerprint Claude Code |
-| `KOU_CC_VERSION` | `2.2.0` | Версия Claude Code CLI в подмене |
-| `KOU_CC_ENTRYPOINT` | `cli` | entrypoint в metadata |
+
+**Claude Code fingerprint** (`src/fingerprint.rs`).
+
+При проксировании в Anthropic роутер по умолчанию маскирует запрос под
+официальный Claude Code CLI: подсовывает `User-Agent: claude-cli/...`,
+заголовок `x-anthropic-billing-header`, `x-claude-code-session-id`, набор
+`anthropic-beta` фич (prompt-caching-scope, fast-mode, context-1m,
+structured-outputs и т.д.), и инжектит `metadata.user_id` в body. Это нужно
+чтобы (а) попасть в Claude-Code billing-cohort, (б) получить доступ к
+1P-only beta-флагам, недоступным обычному API.
+
+⚠️ Подмена нарушает Anthropic ToS. На свой страх и риск.
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `KOU_CC_FINGERPRINT` | `1` (включено) | `0` / `false` — выключить всю подмену |
+| `KOU_CC_VERSION` | `2.2.0` | Версия Claude Code CLI, под которую косим |
+| `KOU_CC_ENTRYPOINT` | `cli` | Метка в `cc_entrypoint` billing-хедера и UA (`cli`/`sdk`/`vscode`/...) |
+| `KOU_CC_USER_TYPE` | `external` | `external` / `internal` (Anthropic employees) |
+| `KOU_CC_WORKLOAD` | — | Тег для billing attribution (e.g. `cron-task`) |
+| `KOU_CC_AGENT_SDK_VERSION` | — | Версия Agent SDK, добавляется в UA |
+| `KOU_CC_CLIENT_APP` | — | Свой `client-app/...` маркер в UA |
+| `KOU_CC_DEVICE_ID` | auto | Переопределить device_id (ровно 64 hex chars). По умолчанию генерится один раз и кешируется в `~/.config/kou-router/device_id` |
+| `KOU_CC_ANT_INTERNAL` | `0` | Включить ant-internal beta `cli-internal-2026-02-09` |
+| `KOU_CC_OAUTH` | `0` | Включить `oauth-2025-04-20` beta (для OAuth-подписчиков) |
 
 ### Тесты
 
