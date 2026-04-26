@@ -1,6 +1,24 @@
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use std::{fs, path::Path};
+
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 
 pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let options = database_url
+        .parse::<SqliteConnectOptions>()?
+        .create_if_missing(true);
+
+    let filename = options.get_filename();
+    if filename != Path::new(":memory:") {
+        if let Some(parent) = filename.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
+            }
+        }
+    }
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .after_connect(|conn, _meta| {
@@ -11,7 +29,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
                 Ok(())
             })
         })
-        .connect(database_url)
+        .connect_with(options)
         .await?;
 
     sqlx::query(
