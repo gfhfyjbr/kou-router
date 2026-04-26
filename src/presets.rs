@@ -452,8 +452,8 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             "Claude OAuth",
             "https://api.anthropic.com/v1",
             "oauth",
-            "x-api-key",
-            None,
+            "bearer",
+            Some("Bearer"),
             &[
                 ("Anthropic-Version", "2023-06-01"),
                 (
