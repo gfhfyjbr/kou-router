@@ -64,12 +64,57 @@ impl PassthroughHeaders {
             if !self
                 .headers
                 .iter()
-                .any(|(n, _)| n.to_lowercase() == name.to_lowercase())
+                .any(|(n, _)| n.eq_ignore_ascii_case(&name))
             {
                 self.headers.push((name, value));
             }
         }
     }
+
+    pub fn set_if_missing(&mut self, name: &str, value: &str) {
+        if !self
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            self.headers.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    pub fn merge_csv_header(&mut self, name: &str, values: &str) {
+        if values.trim().is_empty() {
+            return;
+        }
+        if let Some((_, existing)) = self
+            .headers
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            let mut merged: Vec<String> = existing
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            for value in values.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+                if !merged.iter().any(|item| item == value) {
+                    merged.push(value.to_string());
+                }
+            }
+            *existing = merged.join(",");
+        } else {
+            self.headers.push((name.to_string(), values.to_string()));
+        }
+    }
+
+    pub fn ensure_claude_files_api_defaults(&mut self) {
+        self.set_if_missing("anthropic-version", "2023-06-01");
+        self.merge_csv_header(
+            "anthropic-beta",
+            "files-api-2025-04-14,oauth-2025-04-20",
+        );
+    }
+
 }
 
 /// Result of upstream execution — either buffered or streaming
@@ -422,18 +467,29 @@ impl UpstreamClient {
     pub async fn execute_raw_proxy(
         &self,
         provider: &ProviderConnection,
+        method: Method,
         path: &str,
-        payload: &Value,
+        payload: Option<&Value>,
         passthrough_headers: Option<&PassthroughHeaders>,
-    ) -> AppResult<(StatusCode, Vec<(String, String)>, String)> {
+    ) -> AppResult<(StatusCode, Vec<(String, String)>, Option<String>, Vec<u8>)> {
         let url = build_url(&provider.base_url, path);
-        let builder = self.client.request(Method::POST, url).json(payload);
+        let builder = self.client.request(method, url);
+        let builder = if let Some(payload) = payload {
+            builder.json(payload)
+        } else {
+            builder
+        };
         let builder = apply_passthrough_headers(builder, passthrough_headers);
         let response = apply_provider_headers(builder, provider).send().await?;
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let resp_headers = Self::extract_response_headers(response.headers());
-        let body = response.text().await?;
-        Ok((status, resp_headers, body))
+        let body = response.bytes().await?.to_vec();
+        Ok((status, resp_headers, content_type, body))
     }
 
     pub async fn execute_audio_speech(
@@ -659,6 +715,7 @@ fn endpoint_path(
         }
         EndpointKind::Messages => "/messages".to_string(),
         EndpointKind::Responses => "/responses".to_string(),
+        EndpointKind::Files => "/files".to_string(),
         EndpointKind::OllamaChat => "/api/chat".to_string(),
         EndpointKind::Embeddings => "/embeddings".to_string(),
         EndpointKind::ImagesGenerations => "/images/generations".to_string(),
@@ -813,6 +870,7 @@ mod tests {
             (EndpointKind::Completions, "/chat/completions"),
             (EndpointKind::Messages, "/messages"),
             (EndpointKind::Responses, "/responses"),
+            (EndpointKind::Files, "/files"),
             (EndpointKind::OllamaChat, "/api/chat"),
             (EndpointKind::Embeddings, "/embeddings"),
             (EndpointKind::ImagesGenerations, "/images/generations"),
@@ -946,6 +1004,39 @@ mod tests {
             build_url("https://api.test.com", "https://other.com/path"),
             "https://other.com/path"
         );
+    }
+
+    #[test]
+    fn test_passthrough_headers_merge_csv_header_deduplicates() {
+        let mut headers = PassthroughHeaders {
+            headers: vec![("anthropic-beta".to_string(), "oauth-2025-04-20".to_string())],
+        };
+        headers.merge_csv_header(
+            "anthropic-beta",
+            "files-api-2025-04-14,oauth-2025-04-20",
+        );
+        let value = headers
+            .headers
+            .iter()
+            .find(|(name, _)| name == "anthropic-beta")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(value, "oauth-2025-04-20,files-api-2025-04-14");
+    }
+
+    #[test]
+    fn test_passthrough_headers_ensure_claude_files_api_defaults() {
+        let mut headers = PassthroughHeaders::default();
+        headers.ensure_claude_files_api_defaults();
+        assert!(headers
+            .headers
+            .iter()
+            .any(|(name, value)| name == "anthropic-version" && value == "2023-06-01"));
+        assert!(headers.headers.iter().any(|(name, value)| {
+            name == "anthropic-beta"
+                && value.contains("files-api-2025-04-14")
+                && value.contains("oauth-2025-04-20")
+        }));
     }
 
     #[test]

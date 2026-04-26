@@ -80,9 +80,9 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             &[("Anthropic-Version", "2023-06-01")],
             &[("messages", "/messages")],
             &[],
-            &["messages"],
+            &["chat", "messages", "responses", "files"],
             Some("anthropic/claude-sonnet-4.6"),
-            "Соответствует OmniRoute registry. Полный OpenAI↔Claude translator ещё не перенесён; сейчас это scaffold под messages-style integration.",
+            "Anthropic preset for Claude-compatible server routing: OpenAI chat/responses requests translate to Messages API, plus raw passthrough support for count_tokens and Files API content downloads.",
         ),
         preset(
             "openrouter",
@@ -463,9 +463,9 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             ],
             &[("messages", "/messages")],
             &[],
-            &["messages"],
+            &["chat", "messages", "responses", "files"],
             Some("claude-oauth/claude-sonnet-4.6"),
-            "Claude Code OAuth preset with native authorization-code exchange and refresh support for managed provider accounts.",
+            "Claude Code OAuth preset with native authorization-code exchange, OpenAI chat/responses compatibility via Messages translation, and Claude-compatible Files API content proxying for managed provider accounts.",
         ),
         preset(
             "antigravity",

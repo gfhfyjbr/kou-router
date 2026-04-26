@@ -178,6 +178,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
+        .route("/v1/files/{file_id}/content", get(files_content))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{*path}", post(responses_with_suffix))
         .route("/v1/api/chat", post(ollama_chat))
@@ -364,14 +365,21 @@ async fn messages_count_tokens(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (status, resp_headers, body) = state
+    let routed = state
         .service
-        .proxy_raw_to_provider(request_id.clone(), "/messages/count_tokens", &payload, Some(pt))
+        .proxy_raw_to_provider(
+            request_id.clone(),
+            EndpointKind::Messages,
+            reqwest::Method::POST,
+            "/messages/count_tokens",
+            Some(&payload),
+            Some(pt),
+        )
         .await?;
 
-    let mut builder = Response::builder().status(status);
+    let mut builder = Response::builder().status(routed.status);
     // Forward upstream response headers
-    for (name, value) in &resp_headers {
+    for (name, value) in &routed.response_headers {
         if let (Ok(hn), Ok(hv)) = (
             axum::http::header::HeaderName::from_bytes(name.as_bytes()),
             axum::http::HeaderValue::from_str(value),
@@ -379,8 +387,55 @@ async fn messages_count_tokens(
             builder = builder.header(hn, hv);
         }
     }
-    builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
-    Ok(builder.body(Body::from(body)).unwrap().into_response())
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        routed.content_type.as_deref().unwrap_or("application/json"),
+    );
+    Ok(builder.body(Body::from(routed.body)).unwrap().into_response())
+
+}
+
+async fn files_content(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(file_id): Path<String>,
+) -> AppResult<Response> {
+    let mut pt = PassthroughHeaders::from_header_map(&headers);
+    pt.ensure_claude_files_api_defaults();
+    let request_id = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("x-client-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let upstream_path = format!("/files/{file_id}/content");
+    let routed = state
+        .service
+        .proxy_raw_to_provider(
+            request_id.clone(),
+            EndpointKind::Files,
+            reqwest::Method::GET,
+            &upstream_path,
+            None,
+            Some(pt),
+        )
+        .await?;
+
+    let mut builder = Response::builder()
+        .status(routed.status)
+        .header("x-request-id", &request_id);
+    for (name, value) in &routed.response_headers {
+        if let (Ok(hn), Ok(hv)) = (
+            axum::http::header::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(hn, hv);
+        }
+    }
+    if let Some(content_type) = routed.content_type.as_deref() {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    Ok(builder.body(Body::from(routed.body)).unwrap().into_response())
 }
 
 async fn responses(
@@ -560,7 +615,6 @@ async fn route_json(
             } else if let Some(map) = body.as_object_mut() {
                 map.insert("_kou_router".to_string(), serde_json::to_value(&r.debug)?);
             }
-            // Attach upstream response headers (rate-limit, retry-after, request-id)
             for (name, value) in &r.response_headers {
                 if let (Ok(hn), Ok(hv)) = (
                     axum::http::header::HeaderName::from_bytes(name.as_bytes()),
@@ -593,7 +647,6 @@ async fn route_json(
                 .header("cache-control", "no-cache")
                 .header("connection", "keep-alive")
                 .header("x-request-id", &request_id);
-            // Attach upstream response headers (rate-limit, retry-after, request-id)
             for (name, value) in &s.response_headers {
                 if let (Ok(hn), Ok(hv)) = (
                     axum::http::header::HeaderName::from_bytes(name.as_bytes()),
@@ -603,6 +656,21 @@ async fn route_json(
                 }
             }
             Ok(builder.body(body).unwrap().into_response())
+        }
+        RoutedResult::Raw(r) => {
+            let mut builder = Response::builder().status(r.status).header("x-request-id", &request_id);
+            for (name, value) in &r.response_headers {
+                if let (Ok(hn), Ok(hv)) = (
+                    axum::http::header::HeaderName::from_bytes(name.as_bytes()),
+                    axum::http::HeaderValue::from_str(value),
+                ) {
+                    builder = builder.header(hn, hv);
+                }
+            }
+            if let Some(content_type) = r.content_type.as_deref() {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+            }
+            Ok(builder.body(Body::from(r.body)).unwrap().into_response())
         }
     }
 }

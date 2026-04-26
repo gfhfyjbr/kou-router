@@ -411,6 +411,7 @@ pub enum EndpointKind {
     Completions,
     Messages,
     Responses,
+    Files,
     OllamaChat,
     Embeddings,
     ImagesGenerations,
@@ -421,6 +422,7 @@ pub enum EndpointKind {
     AudioTranscriptions,
     MusicGenerations,
     VideosGenerations,
+
 }
 
 impl EndpointKind {
@@ -430,6 +432,7 @@ impl EndpointKind {
             EndpointKind::Completions => "completions",
             EndpointKind::Messages => "messages",
             EndpointKind::Responses => "responses",
+            EndpointKind::Files => "files",
             EndpointKind::OllamaChat => "ollama.chat",
             EndpointKind::Embeddings => "embeddings",
             EndpointKind::ImagesGenerations => "images.generations",
@@ -448,6 +451,7 @@ impl EndpointKind {
             EndpointKind::ChatCompletions | EndpointKind::Completions => "chat",
             EndpointKind::Messages => "messages",
             EndpointKind::Responses => "responses",
+            EndpointKind::Files => "files",
             EndpointKind::OllamaChat => "ollama.chat",
             EndpointKind::Embeddings => "embeddings",
             EndpointKind::ImagesGenerations => "images",
@@ -478,6 +482,7 @@ pub fn default_supported_endpoints() -> Vec<String> {
         "chat".to_string(),
         "messages".to_string(),
         "responses".to_string(),
+        "files".to_string(),
         "ollama.chat".to_string(),
         "embeddings".to_string(),
         "images".to_string(),

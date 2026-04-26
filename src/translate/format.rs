@@ -12,10 +12,16 @@ pub enum ProtocolFormat {
 
 impl ProtocolFormat {
     /// Detect source format from endpoint kind + request body heuristics
-    pub fn detect_source(endpoint: EndpointKind, _body: &Value) -> Self {
+    pub fn detect_source(endpoint: EndpointKind, body: &Value) -> Self {
         match endpoint {
             EndpointKind::Messages => ProtocolFormat::Claude,
-            EndpointKind::Responses => ProtocolFormat::OpenAIResponses,
+            EndpointKind::Responses => {
+                if body.get("messages").is_some() && body.get("input").is_none() {
+                    ProtocolFormat::OpenAI
+                } else {
+                    ProtocolFormat::OpenAIResponses
+                }
+            }
             EndpointKind::OllamaChat => ProtocolFormat::Ollama,
             EndpointKind::ChatCompletions
             | EndpointKind::Completions
@@ -26,6 +32,7 @@ impl ProtocolFormat {
             | EndpointKind::Moderations
             | EndpointKind::Rerank
             | EndpointKind::Search
+            | EndpointKind::Files
             | EndpointKind::AudioSpeech
             | EndpointKind::AudioTranscriptions => ProtocolFormat::OpenAI,
         }
@@ -122,6 +129,15 @@ mod tests {
         assert_eq!(
             ProtocolFormat::detect_source(EndpointKind::Responses, &body),
             ProtocolFormat::OpenAIResponses
+        );
+    }
+
+    #[test]
+    fn test_detect_source_responses_with_normalized_messages_uses_openai() {
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        assert_eq!(
+            ProtocolFormat::detect_source(EndpointKind::Responses, &body),
+            ProtocolFormat::OpenAI
         );
     }
 

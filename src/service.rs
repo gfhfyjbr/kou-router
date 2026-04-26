@@ -161,6 +161,15 @@ pub enum RoutedResult {
     Json(RoutedResponse),
     /// True SSE streaming relay
     Stream(RoutedStream),
+    /// Raw passthrough relay preserving upstream bytes/content-type
+    Raw(RawRoutedResponse),
+}
+
+pub struct RawRoutedResponse {
+    pub status: reqwest::StatusCode,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub response_headers: Vec<(String, String)>,
 }
 
 pub struct RoutedStream {
@@ -820,12 +829,14 @@ impl RouterService {
     pub async fn proxy_raw_to_provider(
         &self,
         request_id: String,
+        endpoint: EndpointKind,
+        method: reqwest::Method,
         upstream_path: &str,
-        payload: &serde_json::Value,
+        payload: Option<&serde_json::Value>,
         passthrough_headers: Option<PassthroughHeaders>,
-    ) -> AppResult<(reqwest::StatusCode, Vec<(String, String)>, String)> {
+    ) -> AppResult<RawRoutedResponse> {
         let model = payload
-            .get("model")
+            .and_then(|value| value.get("model"))
             .and_then(|value| value.as_str())
             .unwrap_or("");
 
@@ -850,7 +861,7 @@ impl RouterService {
             providers
                 .iter()
                 .filter(|provider| {
-                    supports_endpoint(&provider.supported_endpoints, EndpointKind::Messages)
+                    supports_endpoint(&provider.supported_endpoints, endpoint)
                         && is_anthropic_compatible_provider(provider)
                 })
                 .cloned()
@@ -872,10 +883,11 @@ impl RouterService {
         matching.sort_by_key(|provider| provider.priority);
 
         if matching.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "no provider found for model '{}'",
-                model
-            )));
+            return Err(AppError::BadRequest(if model.is_empty() {
+                format!("no provider found for endpoint '{}'", endpoint.as_str())
+            } else {
+                format!("no provider found for model '{}'", model)
+            }));
         }
 
         let mut debug_sequence_no = 0_i64;
@@ -889,6 +901,7 @@ impl RouterService {
             for (resolved_provider, selected_account) in execution_targets {
                 debug_sequence_no += 1;
                 let sequence_no = debug_sequence_no;
+                let raw_request = payload.cloned().unwrap_or(serde_json::Value::Null);
                 persist_request_debug_log(
                     self.repository.clone(),
                     NewRequestDebugLog {
@@ -900,21 +913,23 @@ impl RouterService {
                         model: model.to_string(),
                         endpoint: upstream_path.to_string(),
                         sequence_no,
-                        raw_body: serde_json::to_string(payload)?,
+                        raw_body: serde_json::to_string(&raw_request)?,
                     },
                 );
 
-                let (status, resp_headers, body) = self
+                let (status, resp_headers, content_type, body) = self
                     .upstream
                     .execute_raw_proxy(
                         &resolved_provider,
+                        method.clone(),
                         upstream_path,
                         payload,
                         passthrough_headers.as_ref(),
                     )
                     .await?;
-                let parsed_body = serde_json::from_str(&body)
-                    .unwrap_or_else(|_| serde_json::json!({"raw": body.clone()}));
+                let body_text = String::from_utf8_lossy(&body).to_string();
+                let parsed_body = serde_json::from_slice::<serde_json::Value>(&body)
+                    .unwrap_or_else(|_| serde_json::json!({"raw": body_text.clone()}));
                 persist_response_debug_log(
                     self.repository.clone(),
                     build_response_debug_log(
@@ -924,9 +939,9 @@ impl RouterService {
                         model.to_string(),
                         sequence_no,
                         i64::from(status.as_u16()),
-                        body.clone(),
+                        body_text.clone(),
                         &parsed_body,
-                        EndpointKind::Messages,
+                        endpoint,
                         is_codex_provider(&provider),
                     ),
                 );
@@ -937,27 +952,42 @@ impl RouterService {
                             .mark_provider_account_success(&account.id)
                             .await?;
                     }
-                    return Ok((status, resp_headers, body));
+                    return Ok(RawRoutedResponse {
+                        status,
+                        body,
+                        content_type,
+                        response_headers: resp_headers,
+                    });
                 }
 
                 self.repository
-                    .mark_provider_failure(&provider.id, &body)
+                    .mark_provider_failure(&provider.id, &body_text)
                     .await?;
                 if let Some(account) = selected_account.as_ref() {
                     self.repository
-                        .mark_provider_account_failure(&account.id, &body)
+                        .mark_provider_account_failure(&account.id, &body_text)
                         .await?;
                 }
-                let should_fallback = fallback_error(status, &body);
-                last_error = Some((status, resp_headers, body));
+                let should_fallback = fallback_error(status, &body_text);
+                last_error = Some(RawRoutedResponse {
+                    status,
+                    body,
+                    content_type,
+                    response_headers: resp_headers,
+                });
                 if !should_fallback && let Some(last_error) = last_error {
                     return Ok(last_error);
                 }
             }
         }
 
-        last_error
-            .ok_or_else(|| AppError::BadRequest(format!("no provider found for model '{}'", model)))
+        last_error.ok_or_else(|| {
+            AppError::BadRequest(if model.is_empty() {
+                format!("no provider found for endpoint '{}'", endpoint.as_str())
+            } else {
+                format!("no provider found for model '{}'", model)
+            })
+        })
     }
 
     async fn execution_targets(
@@ -1357,6 +1387,11 @@ fn normalize_request(
                 object.insert("messages".to_string(), messages);
             }
         }
+        EndpointKind::Files => {
+            return Err(AppError::BadRequest(
+                "files endpoints should use raw proxy routing".into(),
+            ));
+        }
         EndpointKind::OllamaChat => {
             if object.get("messages").is_none() {
                 return Err(AppError::BadRequest("ollama chat requires messages".into()));
@@ -1452,6 +1487,7 @@ fn normalize_request(
             ));
         }
         EndpointKind::ChatCompletions => {}
+
     }
 
     let model = object
@@ -1753,6 +1789,9 @@ fn adapt_success_body(
         | EndpointKind::Moderations
         | EndpointKind::Rerank
         | EndpointKind::Search => Ok(json_body),
+        EndpointKind::Files => Err(AppError::BadRequest(
+            "files endpoints should not use JSON success adapter".into(),
+        )),
         EndpointKind::AudioSpeech | EndpointKind::AudioTranscriptions => Err(AppError::BadRequest(
             "audio endpoints should not use JSON success adapter".into(),
         )),
@@ -2359,6 +2398,58 @@ mod tests {
 
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].provider, "claude-oauth");
+    }
+
+    #[test]
+    fn test_supports_endpoint_chat_family_matches_chat_capability() {
+        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::ChatCompletions));
+        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::Responses));
+        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::Messages));
+    }
+
+    #[test]
+    fn test_supports_endpoint_files_capability() {
+        assert!(supports_endpoint(&["files".to_string()], EndpointKind::Files));
+        assert!(!supports_endpoint(&["messages".to_string()], EndpointKind::Files));
+    }
+
+    #[test]
+    fn test_find_providers_for_bare_claude_model_does_not_imply_files_support() {
+        let provider = crate::models::ProviderConnection {
+            id: String::new(),
+            provider: "claude-oauth".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: None,
+            auth_type: "oauth".to_string(),
+            auth_header: "x-api-key".to_string(),
+            auth_prefix: None,
+            extra_headers: Default::default(),
+            endpoint_paths: Default::default(),
+            stream_endpoint_paths: Default::default(),
+            model_prefix: "claude-oauth".to_string(),
+            name: None,
+            enabled: true,
+            priority: 0,
+            default_model: Some("claude-oauth/claude-sonnet-4.6".to_string()),
+            supported_endpoints: vec!["messages".to_string()],
+            rate_limit_protection: false,
+            last_error: None,
+            last_error_at: None,
+            last_error_type: None,
+            last_error_source: None,
+            rate_limited_until: None,
+            circuit_open_until: None,
+            last_used_at: None,
+            backoff_level: 0,
+            consecutive_use_count: 0,
+            test_status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            protocol_format: Some("claude".to_string()),
+        };
+        let matching = find_providers_for_bare_model(&[provider.clone()], "claude-sonnet-4.6");
+        assert_eq!(matching.len(), 1);
+        assert!(!supports_endpoint(&matching[0].supported_endpoints, EndpointKind::Files));
     }
 
     #[test]
