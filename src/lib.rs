@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod models;
 pub mod oauth;
 pub mod presets;
+pub mod proxy;
 pub mod ratelimit;
 pub mod repository;
 pub mod retry;

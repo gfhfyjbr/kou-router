@@ -25,6 +25,7 @@ use crate::{
     },
     oauth::{OAuthCompleteAuthorizationRequest, OAuthService, OAuthStartAuthorizationRequest},
     presets::{ImportProviderPresetRequest, import_request_to_provider, provider_presets},
+    proxy::{self, ProxyClientCache},
     repository::SqliteRepository,
     service::{RoutedResult, RouterService},
     upstream::PassthroughHeaders,
@@ -40,9 +41,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(repository: Arc<SqliteRepository>) -> Self {
-        let service = RouterService::new(repository.clone());
+        let clients = ProxyClientCache::new();
+        let service = RouterService::with_clients(repository.clone(), clients.clone());
         let audio = AudioService::new(repository.clone());
-        let oauth = OAuthService::new(repository.clone());
+        let oauth = OAuthService::with_clients(repository.clone(), clients);
         Self {
             repository,
             service,
@@ -63,6 +65,14 @@ struct ProviderAccountOAuthStartBody {
     #[serde(default)]
     provider_account_id: Option<String>,
     redirect_uri: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProviderAccountProxyBody {
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +105,7 @@ struct ProviderAccountResponse {
     refresh_error: Option<String>,
     backoff_level: i64,
     consecutive_use_count: i64,
+    proxy_url: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -124,6 +135,7 @@ impl From<ProviderAccount> for ProviderAccountResponse {
             refresh_error: account.refresh_error,
             backoff_level: account.backoff_level,
             consecutive_use_count: account.consecutive_use_count,
+            proxy_url: account.proxy_url,
             created_at: account.created_at,
             updated_at: account.updated_at,
         }
@@ -138,6 +150,7 @@ struct OAuthSessionResponse {
     provider_account_id: Option<String>,
     redirect_uri: String,
     scopes: Vec<String>,
+    proxy_url: Option<String>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
@@ -152,6 +165,7 @@ impl From<OAuthSession> for OAuthSessionResponse {
             provider_account_id: session.provider_account_id,
             redirect_uri: session.redirect_uri,
             scopes: session.scopes,
+            proxy_url: session.proxy_url,
             created_at: session.created_at,
             expires_at: session.expires_at,
             consumed_at: session.consumed_at,
@@ -221,6 +235,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/provider-accounts/{id}/refresh",
             post(refresh_provider_account),
+        )
+        .route(
+            "/api/provider-accounts/{id}/proxy",
+            post(set_provider_account_proxy),
         )
         .route(
             "/api/provider-accounts/{id}/disable",
@@ -391,8 +409,10 @@ async fn messages_count_tokens(
         axum::http::header::CONTENT_TYPE,
         routed.content_type.as_deref().unwrap_or("application/json"),
     );
-    Ok(builder.body(Body::from(routed.body)).unwrap().into_response())
-
+    Ok(builder
+        .body(Body::from(routed.body))
+        .unwrap()
+        .into_response())
 }
 
 async fn files_content(
@@ -435,7 +455,10 @@ async fn files_content(
     if let Some(content_type) = routed.content_type.as_deref() {
         builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
     }
-    Ok(builder.body(Body::from(routed.body)).unwrap().into_response())
+    Ok(builder
+        .body(Body::from(routed.body))
+        .unwrap()
+        .into_response())
 }
 
 async fn responses(
@@ -658,7 +681,9 @@ async fn route_json(
             Ok(builder.body(body).unwrap().into_response())
         }
         RoutedResult::Raw(r) => {
-            let mut builder = Response::builder().status(r.status).header("x-request-id", &request_id);
+            let mut builder = Response::builder()
+                .status(r.status)
+                .header("x-request-id", &request_id);
             for (name, value) in &r.response_headers {
                 if let (Ok(hn), Ok(hv)) = (
                     axum::http::header::HeaderName::from_bytes(name.as_bytes()),
@@ -811,6 +836,7 @@ async fn start_provider_account_oauth(
             provider_connection_id: payload.provider_connection_id,
             provider_account_id: payload.provider_account_id,
             redirect_uri: payload.redirect_uri,
+            proxy_url: payload.proxy_url,
         })
         .await?;
 
@@ -841,6 +867,28 @@ async fn refresh_provider_account(
     Path(id): Path<String>,
 ) -> AppResult<Json<ProviderAccountResponse>> {
     let account = state.oauth.refresh_provider_account(&id).await?;
+    Ok(Json(account.into()))
+}
+
+async fn set_provider_account_proxy(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateProviderAccountProxyBody>,
+) -> AppResult<Json<ProviderAccountResponse>> {
+    let proxy_url = normalize_proxy_url(payload.proxy_url.as_deref())?;
+    let updated = state
+        .repository
+        .update_provider_account_proxy(&id, proxy_url.as_deref())
+        .await?;
+    if !updated {
+        return Err(AppError::NotFound(format!("provider account {id}")));
+    }
+    let account = state
+        .repository
+        .get_provider_account(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("provider account {id}")))?;
     Ok(Json(account.into()))
 }
 
@@ -886,6 +934,16 @@ async fn delete_provider_account(
         Ok(Json(json!({"status": "ok", "id": id})))
     } else {
         Err(AppError::NotFound(format!("provider account {id}")))
+    }
+}
+
+fn normalize_proxy_url(proxy_url: Option<&str>) -> AppResult<Option<String>> {
+    match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            proxy::parse_and_validate(value)?;
+            Ok(Some(value.to_owned()))
+        }
+        None => Ok(None),
     }
 }
 

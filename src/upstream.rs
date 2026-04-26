@@ -1,3 +1,8 @@
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
@@ -13,13 +18,14 @@ use crate::{
         AudioTranscriptionPayload, EndpointKind, ProviderAccount, ProviderAccountAuthMode,
         ProviderChatAttempt, ProviderConnection,
     },
+    proxy::ProxyClientCache,
     search::{SearchHttpMethod, build_search_request, normalize_search_response},
 };
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+pub type BoxErrorStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
+pub type TeeBuffer = Arc<Mutex<Vec<u8>>>;
 
 /// Headers from the incoming request that should be passed through to upstream.
 /// Primarily for Anthropic-specific headers that Claude Code sends.
@@ -48,10 +54,10 @@ impl PassthroughHeaders {
         ];
         let mut extracted = Vec::new();
         for &name in PASSTHROUGH_NAMES {
-            if let Some(value) = headers.get(name) {
-                if let Ok(v) = value.to_str() {
-                    extracted.push((name.to_string(), v.to_string()));
-                }
+            if let Some(value) = headers.get(name)
+                && let Ok(v) = value.to_str()
+            {
+                extracted.push((name.to_string(), v.to_string()));
             }
         }
         Self { headers: extracted }
@@ -96,7 +102,11 @@ impl PassthroughHeaders {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .collect();
-            for value in values.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            for value in values
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 if !merged.iter().any(|item| item == value) {
                     merged.push(value.to_string());
                 }
@@ -109,12 +119,8 @@ impl PassthroughHeaders {
 
     pub fn ensure_claude_files_api_defaults(&mut self) {
         self.set_if_missing("anthropic-version", "2023-06-01");
-        self.merge_csv_header(
-            "anthropic-beta",
-            "files-api-2025-04-14,oauth-2025-04-20",
-        );
+        self.merge_csv_header("anthropic-beta", "files-api-2025-04-14,oauth-2025-04-20");
     }
-
 }
 
 /// Result of upstream execution — either buffered or streaming
@@ -133,12 +139,7 @@ pub struct StreamingProviderResponse {
     pub response_headers: Vec<(String, String)>,
 }
 
-pub fn tee_stream(
-    stream: BoxStream,
-) -> (
-    Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
-    Arc<Mutex<Vec<u8>>>,
-) {
+pub fn tee_stream(stream: BoxStream) -> (BoxErrorStream, TeeBuffer) {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let buf_clone = buffer.clone();
     let teed = stream.map(move |result| match result {
@@ -190,12 +191,7 @@ pub fn watchdog_stream(
 }
 
 /// Like `tee_stream` but accepts `BoxError` streams (for use after watchdog).
-pub fn tee_stream_boxerror(
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
-) -> (
-    Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
-    Arc<Mutex<Vec<u8>>>,
-) {
+pub fn tee_stream_boxerror(stream: BoxErrorStream) -> (BoxErrorStream, TeeBuffer) {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let buf_clone = buffer.clone();
     let teed = stream.map(move |result| match result {
@@ -212,7 +208,13 @@ pub fn tee_stream_boxerror(
 
 #[derive(Clone)]
 pub struct UpstreamClient {
-    client: Client,
+    clients: ProxyClientCache,
+}
+
+impl Default for UpstreamClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn provider_with_account_auth(
@@ -255,7 +257,7 @@ fn force_codex_responses_stream(
     provider: &ProviderConnection,
     endpoint: EndpointKind,
     request_body: &mut Value,
- ) {
+) {
     if endpoint != EndpointKind::Responses || !is_codex_responses_provider(provider) {
         return;
     }
@@ -299,9 +301,15 @@ pub fn prepare_upstream_request(
 
 impl UpstreamClient {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        Self::with_clients(ProxyClientCache::new())
+    }
+
+    pub fn with_clients(clients: ProxyClientCache) -> Self {
+        Self { clients }
+    }
+
+    fn client_for(&self, proxy_url: Option<&str>) -> AppResult<Client> {
+        self.clients.for_optional(proxy_url)
     }
 
     /// Extract response headers that should be forwarded back to the client.
@@ -314,10 +322,8 @@ impl UpstreamClient {
             let n = name.as_str();
             let matched =
                 FORWARD_EXACT.contains(&n) || FORWARD_PREFIXES.iter().any(|p| n.starts_with(p));
-            if matched {
-                if let Ok(v) = value.to_str() {
-                    result.push((n.to_string(), v.to_string()));
-                }
+            if matched && let Ok(v) = value.to_str() {
+                result.push((n.to_string(), v.to_string()));
             }
         }
         result
@@ -339,6 +345,7 @@ impl UpstreamClient {
             && !content_type.contains("application/problem+json")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         provider: &ProviderConnection,
@@ -348,17 +355,19 @@ impl UpstreamClient {
         payload: &Value,
         inject_model: bool,
         passthrough_headers: Option<&PassthroughHeaders>,
+        proxy_url: Option<&str>,
     ) -> AppResult<UpstreamResult> {
-        let prepared = prepare_upstream_request(
+        let prepared =
+            prepare_upstream_request(provider, endpoint, suffix, model, payload, inject_model);
+        self.execute_prepared(
             provider,
             endpoint,
-            suffix,
             model,
-            payload,
-            inject_model,
-        );
-        self.execute_prepared(provider, endpoint, model, &prepared, passthrough_headers)
-            .await
+            &prepared,
+            passthrough_headers,
+            proxy_url,
+        )
+        .await
     }
 
     pub async fn execute_prepared(
@@ -368,14 +377,16 @@ impl UpstreamClient {
         model: &str,
         prepared: &PreparedUpstreamRequest,
         passthrough_headers: Option<&PassthroughHeaders>,
+        proxy_url: Option<&str>,
     ) -> AppResult<UpstreamResult> {
+        let client = self.client_for(proxy_url)?;
         let request_body = &prepared.request_body;
         if endpoint == EndpointKind::Search {
             let spec = build_search_request(provider, request_body, &prepared.url)?;
             let builder = match spec.method {
-                SearchHttpMethod::Get => self.client.request(Method::GET, spec.url),
+                SearchHttpMethod::Get => client.request(Method::GET, spec.url),
                 SearchHttpMethod::Post => {
-                    let builder = self.client.request(Method::POST, spec.url);
+                    let builder = client.request(Method::POST, spec.url);
                     if let Some(body) = spec.body {
                         builder.json(&body)
                     } else {
@@ -415,7 +426,9 @@ impl UpstreamClient {
                 response_headers: resp_headers,
             }))
         } else {
-            let builder = self.client.request(Method::POST, &prepared.url).json(request_body);
+            let builder = client
+                .request(Method::POST, &prepared.url)
+                .json(request_body);
             let builder = apply_passthrough_headers(builder, passthrough_headers);
             let response = apply_provider_headers(builder, provider).send().await?;
             let status = response.status();
@@ -461,9 +474,10 @@ impl UpstreamClient {
         }
     }
 
-    /// Raw proxy: send a JSON POST to an arbitrary path on the provider's base_url.
-    /// Returns (status, response_headers, body_string). Used for passthrough endpoints
-    /// like /v1/messages/count_tokens.
+    /// Sends a raw request to an arbitrary path on the provider's `base_url`.
+    ///
+    /// Used for passthrough endpoints like `/v1/messages/count_tokens` where
+    /// the upstream bytes and content type must be preserved.
     pub async fn execute_raw_proxy(
         &self,
         provider: &ProviderConnection,
@@ -471,9 +485,11 @@ impl UpstreamClient {
         path: &str,
         payload: Option<&Value>,
         passthrough_headers: Option<&PassthroughHeaders>,
+        proxy_url: Option<&str>,
     ) -> AppResult<(StatusCode, Vec<(String, String)>, Option<String>, Vec<u8>)> {
         let url = build_url(&provider.base_url, path);
-        let builder = self.client.request(method, url);
+        let client = self.client_for(proxy_url)?;
+        let builder = client.request(method, url);
         let builder = if let Some(payload) = payload {
             builder.json(payload)
         } else {
@@ -497,13 +513,15 @@ impl UpstreamClient {
         provider: &ProviderConnection,
         model: &str,
         payload: &Value,
+        proxy_url: Option<&str>,
     ) -> AppResult<AudioResponse> {
         let path = endpoint_path(provider, EndpointKind::AudioSpeech, None, false);
         let url = build_url(&provider.base_url, &path);
         let mut request_body = payload.clone();
         request_body["model"] = Value::String(model.to_string());
 
-        let builder = self.client.request(Method::POST, url).json(&request_body);
+        let client = self.client_for(proxy_url)?;
+        let builder = client.request(Method::POST, url).json(&request_body);
         let response = apply_provider_headers(builder, provider).send().await?;
         let status = response.status();
         let content_type = response
@@ -526,6 +544,7 @@ impl UpstreamClient {
         provider: &ProviderConnection,
         model: &str,
         payload: &AudioTranscriptionPayload,
+        proxy_url: Option<&str>,
     ) -> AppResult<AudioResponse> {
         let path = endpoint_path(provider, EndpointKind::AudioTranscriptions, None, false);
         let url = build_url(&provider.base_url, &path);
@@ -547,7 +566,8 @@ impl UpstreamClient {
             }
         }
 
-        let builder = self.client.request(Method::POST, url).multipart(form);
+        let client = self.client_for(proxy_url)?;
+        let builder = client.request(Method::POST, url).multipart(form);
         let response = apply_provider_headers(builder, provider).send().await?;
         let status = response.status();
         let content_type = response
@@ -698,12 +718,11 @@ fn endpoint_path(
     suffix: Option<&str>,
     stream_requested: bool,
 ) -> String {
-    if stream_requested {
-        if let Some(path) =
+    if stream_requested
+        && let Some(path) =
             provider_path_override(&provider.stream_endpoint_paths, endpoint, suffix)
-        {
-            return path;
-        }
+    {
+        return path;
     }
     if let Some(path) = provider_path_override(&provider.endpoint_paths, endpoint, suffix) {
         return path;
@@ -1011,10 +1030,7 @@ mod tests {
         let mut headers = PassthroughHeaders {
             headers: vec![("anthropic-beta".to_string(), "oauth-2025-04-20".to_string())],
         };
-        headers.merge_csv_header(
-            "anthropic-beta",
-            "files-api-2025-04-14,oauth-2025-04-20",
-        );
+        headers.merge_csv_header("anthropic-beta", "files-api-2025-04-14,oauth-2025-04-20");
         let value = headers
             .headers
             .iter()
@@ -1028,10 +1044,12 @@ mod tests {
     fn test_passthrough_headers_ensure_claude_files_api_defaults() {
         let mut headers = PassthroughHeaders::default();
         headers.ensure_claude_files_api_defaults();
-        assert!(headers
-            .headers
-            .iter()
-            .any(|(name, value)| name == "anthropic-version" && value == "2023-06-01"));
+        assert!(
+            headers
+                .headers
+                .iter()
+                .any(|(name, value)| name == "anthropic-version" && value == "2023-06-01")
+        );
         assert!(headers.headers.iter().any(|(name, value)| {
             name == "anthropic-beta"
                 && value.contains("files-api-2025-04-14")

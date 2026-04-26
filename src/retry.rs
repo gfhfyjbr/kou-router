@@ -81,6 +81,7 @@ pub async fn execute_with_retry(
     model: &str,
     prepared: &PreparedUpstreamRequest,
     passthrough_headers: Option<&PassthroughHeaders>,
+    proxy_url: Option<&str>,
     config: &RetryConfig,
 ) -> AppResult<RetryOutcome> {
     let mut attempts: u32 = 0;
@@ -91,7 +92,14 @@ pub async fn execute_with_retry(
         attempts += 1;
 
         let result = client
-            .execute_prepared(provider, endpoint, model, prepared, passthrough_headers)
+            .execute_prepared(
+                provider,
+                endpoint,
+                model,
+                prepared,
+                passthrough_headers,
+                proxy_url,
+            )
             .await;
 
         match result {

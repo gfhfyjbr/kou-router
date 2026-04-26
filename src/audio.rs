@@ -41,7 +41,7 @@ impl AudioService {
 
         let upstream = self
             .upstream
-            .execute_audio_speech(&provider, &raw_model, &normalized.body)
+            .execute_audio_speech(&provider, &raw_model, &normalized.body, None)
             .await?;
         let debug = RoutingDebug {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -88,7 +88,7 @@ impl AudioService {
 
         let upstream = self
             .upstream
-            .execute_audio_transcription(&provider, &raw_model, &normalized)
+            .execute_audio_transcription(&provider, &raw_model, &normalized, None)
             .await?;
         let attempt = upstream.as_attempt(provider.id.clone(), candidate.clone());
 

@@ -207,6 +207,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             refresh_error TEXT,
             backoff_level INTEGER NOT NULL DEFAULT 0,
             consecutive_use_count INTEGER NOT NULL DEFAULT 0,
+            proxy_url TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(provider_connection_id) REFERENCES provider_connections(id) ON DELETE CASCADE
@@ -215,6 +216,22 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
+
+    let provider_account_columns: Vec<String> = sqlx::query("PRAGMA table_info(provider_accounts)")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
+    let has_provider_account_column =
+        |name: &str| provider_account_columns.iter().any(|value| value == name);
+
+    if !has_provider_account_column("proxy_url") {
+        sqlx::query("ALTER TABLE provider_accounts ADD COLUMN proxy_url TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_provider_accounts_connection_priority ON provider_accounts(provider_connection_id, priority, created_at)",
@@ -238,6 +255,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             redirect_uri TEXT NOT NULL,
             code_verifier TEXT NOT NULL,
             scopes_json TEXT NOT NULL DEFAULT '[]',
+            proxy_url TEXT,
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             consumed_at TEXT,
@@ -248,6 +266,22 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
+
+    let oauth_sessions_columns: Vec<String> = sqlx::query("PRAGMA table_info(oauth_sessions)")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
+    let has_oauth_session_column =
+        |name: &str| oauth_sessions_columns.iter().any(|value| value == name);
+
+    if !has_oauth_session_column("proxy_url") {
+        sqlx::query("ALTER TABLE oauth_sessions ADD COLUMN proxy_url TEXT")
+            .execute(&pool)
+            .await?;
+    }
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_oauth_sessions_provider_connection ON oauth_sessions(provider_connection_id, created_at)",
@@ -411,7 +445,6 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     Ok(pool)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -183,6 +183,7 @@ cargo test
 | POST   | `/api/provider-accounts/oauth/start`                | Стартовать OAuth-авторизацию |
 | POST   | `/api/provider-accounts/oauth/callback`             | Завершить OAuth (`state` + `code`) |
 | POST   | `/api/provider-accounts/{id}/refresh`               | Принудительно обновить токен |
+| POST   | `/api/provider-accounts/{id}/proxy`                 | Задать или убрать прокси аккаунта |
 | POST   | `/api/provider-accounts/{id}/enable`                | Включить |
 | POST   | `/api/provider-accounts/{id}/disable`               | Выключить |
 | DELETE | `/api/provider-accounts/{id}`                       | Удалить |
@@ -198,6 +199,27 @@ cargo test
 
 Возвращает `{ session, authorization_url }`. Дальше клиент открывает URL в
 браузере, ловит `code`+`state` на своём редиректе и шлёт их в `/oauth/callback`.
+
+### Proxy per account
+
+Каждый аккаунт может ходить в апстрим через свой HTTP/HTTPS/SOCKS5 прокси.
+Прокси задаётся при создании аккаунта или отдельным роутом:
+
+```bash
+curl -sX POST http://127.0.0.1:20128/api/provider-accounts/<id>/proxy \
+  -b /tmp/kou.cookie \
+  -H 'content-type: application/json' \
+  -d '{"proxy_url": "socks5h://user:pass@host:1080"}'
+```
+
+Чтобы убрать прокси: `{"proxy_url": null}` или пустая строка.
+
+При OAuth можно сразу привязать прокси к новому аккаунту, передав `proxy_url` в
+`POST /api/provider-accounts/oauth/start`. Прокси используется и для
+inference-запросов, и для token-refresh, и для первого token-exchange.
+
+Стандартные `HTTP_PROXY` / `HTTPS_PROXY` env-переменные **не** учитываются —
+только это поле.
 
 ### Combos / Aliases / Settings / Ratelimits
 
