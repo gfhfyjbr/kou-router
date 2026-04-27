@@ -165,6 +165,7 @@ pub struct ProviderAccount {
     pub backoff_level: i64,
     #[serde(default)]
     pub consecutive_use_count: i64,
+    pub proxy_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -186,6 +187,8 @@ pub struct NewProviderAccount {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub priority: Option<i64>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +201,7 @@ pub struct OAuthSession {
     pub code_verifier: String,
     #[serde(default)]
     pub scopes: Vec<String>,
+    pub proxy_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub consumed_at: Option<DateTime<Utc>>,
@@ -212,6 +216,7 @@ pub struct NewOAuthSession {
     pub code_verifier: String,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    pub proxy_url: Option<String>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -422,7 +427,6 @@ pub enum EndpointKind {
     AudioTranscriptions,
     MusicGenerations,
     VideosGenerations,
-
 }
 
 impl EndpointKind {

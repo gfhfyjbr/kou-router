@@ -12,6 +12,7 @@ use crate::{
         RequestDebugLog, ResponseDebugLog, SettingsPayload, default_supported_endpoints,
         supports_endpoint,
     },
+    proxy,
 };
 
 #[derive(Clone)]
@@ -336,7 +337,7 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
             WHERE provider_connection_id = ?
             ORDER BY priority ASC, created_at ASC
@@ -359,7 +360,7 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
             WHERE provider_connection_id = ?
               AND enabled = 1
@@ -386,7 +387,7 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
             WHERE id = ?
             "#,
@@ -443,6 +444,7 @@ impl SqliteRepository {
         };
         let scopes = input.scopes.clone().unwrap_or_default();
         let expires_at = input.expires_at.map(|value| value.to_rfc3339());
+        let proxy_url = normalize_proxy_url(input.proxy_url.as_deref())?;
 
         sqlx::query(
             r#"
@@ -450,8 +452,8 @@ impl SqliteRepository {
                 id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                 expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
                 last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                last_refresh_at, refresh_error, backoff_level, consecutive_use_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?)
+                last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -467,6 +469,7 @@ impl SqliteRepository {
         .bind(&input.remote_email)
         .bind(if input.enabled { 1_i64 } else { 0_i64 })
         .bind(priority)
+        .bind(&proxy_url)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&self.pool)
@@ -495,9 +498,27 @@ impl SqliteRepository {
             refresh_error: None,
             backoff_level: 0,
             consecutive_use_count: 0,
+            proxy_url,
             created_at: now,
             updated_at: now,
         })
+    }
+
+    pub async fn update_provider_account_proxy(
+        &self,
+        account_id: &str,
+        proxy_url: Option<&str>,
+    ) -> AppResult<bool> {
+        let proxy_url = normalize_proxy_url(proxy_url)?;
+        let now = Utc::now().to_rfc3339();
+        let result =
+            sqlx::query("UPDATE provider_accounts SET proxy_url = ?, updated_at = ? WHERE id = ?")
+                .bind(proxy_url)
+                .bind(&now)
+                .bind(account_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_provider_account_api_key(
@@ -709,8 +730,8 @@ impl SqliteRepository {
             r#"
             INSERT INTO oauth_sessions (
                 id, state, provider_connection_id, provider_account_id, redirect_uri,
-                code_verifier, scopes_json, created_at, expires_at, consumed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                code_verifier, scopes_json, proxy_url, created_at, expires_at, consumed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             "#,
         )
         .bind(&id)
@@ -720,6 +741,7 @@ impl SqliteRepository {
         .bind(&input.redirect_uri)
         .bind(&input.code_verifier)
         .bind(serde_json::to_string(&scopes)?)
+        .bind(&input.proxy_url)
         .bind(now.to_rfc3339())
         .bind(input.expires_at.to_rfc3339())
         .execute(&self.pool)
@@ -733,6 +755,7 @@ impl SqliteRepository {
             redirect_uri: input.redirect_uri,
             code_verifier: input.code_verifier,
             scopes,
+            proxy_url: input.proxy_url,
             created_at: now,
             expires_at: input.expires_at,
             consumed_at: None,
@@ -746,7 +769,7 @@ impl SqliteRepository {
         let rows = sqlx::query(
             r#"
             SELECT id, state, provider_connection_id, provider_account_id, redirect_uri,
-                   code_verifier, scopes_json, created_at, expires_at, consumed_at
+                   code_verifier, scopes_json, proxy_url, created_at, expires_at, consumed_at
             FROM oauth_sessions
             WHERE provider_connection_id = ?
             ORDER BY created_at DESC
@@ -763,7 +786,7 @@ impl SqliteRepository {
         let row = sqlx::query(
             r#"
             SELECT id, state, provider_connection_id, provider_account_id, redirect_uri,
-                   code_verifier, scopes_json, created_at, expires_at, consumed_at
+                    code_verifier, scopes_json, proxy_url, created_at, expires_at, consumed_at
             FROM oauth_sessions
             WHERE id = ?
             "#,
@@ -779,7 +802,7 @@ impl SqliteRepository {
         let row = sqlx::query(
             r#"
             SELECT id, state, provider_connection_id, provider_account_id, redirect_uri,
-                   code_verifier, scopes_json, created_at, expires_at, consumed_at
+                   code_verifier, scopes_json, proxy_url, created_at, expires_at, consumed_at
             FROM oauth_sessions
             WHERE state = ?
             "#,
@@ -1292,6 +1315,7 @@ fn map_provider_account(row: sqlx::sqlite::SqliteRow) -> AppResult<ProviderAccou
         refresh_error: row.try_get("refresh_error")?,
         backoff_level: row.try_get("backoff_level")?,
         consecutive_use_count: row.try_get("consecutive_use_count")?,
+        proxy_url: row.try_get("proxy_url")?,
         created_at: parse_dt(row.try_get("created_at")?)?,
         updated_at: parse_dt(row.try_get("updated_at")?)?,
     })
@@ -1309,6 +1333,7 @@ fn map_oauth_session(row: sqlx::sqlite::SqliteRow) -> AppResult<OAuthSession> {
         redirect_uri: row.try_get("redirect_uri")?,
         code_verifier: row.try_get("code_verifier")?,
         scopes,
+        proxy_url: row.try_get("proxy_url")?,
         created_at: parse_dt(row.try_get("created_at")?)?,
         expires_at: parse_dt(row.try_get("expires_at")?)?,
         consumed_at: parse_optional_dt(row.try_get("consumed_at")?)?,
@@ -1335,6 +1360,16 @@ fn map_combo(row: sqlx::sqlite::SqliteRow) -> AppResult<Combo> {
 
 fn has_usable_secret(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn normalize_proxy_url(proxy_url: Option<&str>) -> AppResult<Option<String>> {
+    match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            proxy::parse_and_validate(value)?;
+            Ok(Some(value.to_owned()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn parse_dt(value: String) -> AppResult<DateTime<Utc>> {
@@ -1413,14 +1448,38 @@ fn infer_model_metadata(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::SqliteRepository;
     use crate::{
         db::init_db,
-        models::{NewRequestDebugLog, NewResponseDebugLog},
+        models::{
+            NewOAuthSession, NewProviderAccount, NewProviderConnection, NewRequestDebugLog,
+            NewResponseDebugLog, ProviderAccountAuthMode,
+        },
     };
+
+    fn test_provider_connection(provider: &str) -> NewProviderConnection {
+        NewProviderConnection {
+            provider: provider.to_owned(),
+            base_url: format!("https://{provider}.test"),
+            api_key: Some("sk-test".to_owned()),
+            auth_type: "apikey".to_owned(),
+            auth_header: "bearer".to_owned(),
+            auth_prefix: None,
+            extra_headers: Default::default(),
+            endpoint_paths: None,
+            stream_endpoint_paths: None,
+            model_prefix: Some(provider.to_owned()),
+            name: None,
+            enabled: true,
+            priority: Some(0),
+            default_model: None,
+            supported_endpoints: None,
+            rate_limit_protection: false,
+            protocol_format: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_insert_request_debug_log_persists_sequence() {
@@ -1428,25 +1487,7 @@ mod tests {
         let repository = SqliteRepository::new(pool);
 
         let provider = repository
-            .create_provider_connection(crate::models::NewProviderConnection {
-                provider: "openai".to_string(),
-                base_url: "https://api.openai.test".to_string(),
-                api_key: Some("sk-test".to_string()),
-                auth_type: "apikey".to_string(),
-                auth_header: "bearer".to_string(),
-                auth_prefix: None,
-                extra_headers: Default::default(),
-                endpoint_paths: None,
-                stream_endpoint_paths: None,
-                model_prefix: Some("openai".to_string()),
-                name: None,
-                enabled: true,
-                priority: Some(0),
-                default_model: None,
-                supported_endpoints: None,
-                rate_limit_protection: false,
-                protocol_format: None,
-            })
+            .create_provider_connection(test_provider_connection("openai"))
             .await
             .unwrap();
 
@@ -1474,25 +1515,7 @@ mod tests {
         let repository = SqliteRepository::new(pool);
 
         let provider = repository
-            .create_provider_connection(crate::models::NewProviderConnection {
-                provider: "codex".to_string(),
-                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                api_key: Some("sk-test".to_string()),
-                auth_type: "apikey".to_string(),
-                auth_header: "bearer".to_string(),
-                auth_prefix: None,
-                extra_headers: Default::default(),
-                endpoint_paths: None,
-                stream_endpoint_paths: None,
-                model_prefix: Some("codex".to_string()),
-                name: None,
-                enabled: true,
-                priority: Some(0),
-                default_model: None,
-                supported_endpoints: None,
-                rate_limit_protection: false,
-                protocol_format: None,
-            })
+            .create_provider_connection(test_provider_connection("codex"))
             .await
             .unwrap();
 
@@ -1516,5 +1539,72 @@ mod tests {
         assert_eq!(log.provider_id, provider.id);
         assert_eq!(log.sequence_no, 9);
         assert_eq!(log.upstream_status, 502);
+    }
+
+    #[tokio::test]
+    async fn round_trip_provider_account_proxy_url() {
+        let pool = init_db("sqlite::memory:").await.unwrap();
+        let repository = SqliteRepository::new(pool);
+        let provider = repository
+            .create_provider_connection(test_provider_connection("claude"))
+            .await
+            .unwrap();
+
+        let account = repository
+            .create_provider_account(NewProviderAccount {
+                provider_connection_id: provider.id.clone(),
+                label: Some("proxy account".to_owned()),
+                auth_mode: ProviderAccountAuthMode::ApiKey,
+                api_key: Some("sk-test".to_owned()),
+                access_token: None,
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                remote_account_id: None,
+                remote_email: None,
+                enabled: true,
+                priority: Some(0),
+                proxy_url: Some("socks5h://1.2.3.4:1080".to_owned()),
+            })
+            .await
+            .unwrap();
+        let account = repository
+            .get_provider_account(&account.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(account.proxy_url.as_deref(), Some("socks5h://1.2.3.4:1080"));
+    }
+
+    #[tokio::test]
+    async fn round_trip_oauth_session_proxy_url() {
+        let pool = init_db("sqlite::memory:").await.unwrap();
+        let repository = SqliteRepository::new(pool);
+        let provider = repository
+            .create_provider_connection(test_provider_connection("claude"))
+            .await
+            .unwrap();
+
+        let session = repository
+            .create_oauth_session(NewOAuthSession {
+                state: "state".to_owned(),
+                provider_connection_id: provider.id,
+                provider_account_id: None,
+                redirect_uri: "http://localhost/callback".to_owned(),
+                code_verifier: "verifier".to_owned(),
+                scopes: Some(vec!["scope".to_owned()]),
+                proxy_url: Some("socks5h://1.2.3.4:1080".to_owned()),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            })
+            .await
+            .unwrap();
+        let session = repository
+            .get_oauth_session_by_state(&session.state)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(session.proxy_url.as_deref(), Some("socks5h://1.2.3.4:1080"));
     }
 }

@@ -11,18 +11,18 @@ use crate::{
     models::{
         ComboStrategy, EndpointKind, NewRequestDebugLog, NewResponseDebugLog, NormalizedRequest,
         OpenAiModelsResponse, ProviderAccount, ProviderAccountAuthMode,
-        ProviderAccountRoutingStrategy, ProviderChatAttempt, RoutingDebug,
-        RoutingProviderAccount, SettingsPayload, supports_endpoint,
+        ProviderAccountRoutingStrategy, ProviderChatAttempt, RoutingDebug, RoutingProviderAccount,
+        SettingsPayload, supports_endpoint,
     },
     oauth::OAuthService,
+    proxy::ProxyClientCache,
     ratelimit::{RateLimitTracker, parse_rate_limit_headers},
     repository::SqliteRepository,
     retry::{RetryConfig, execute_with_retry},
     translate::{ProtocolFormat, TranslatorRegistry},
     upstream::{
         BoxError, PassthroughHeaders, UpstreamClient, UpstreamResult, fallback_error,
-        prepare_upstream_request, provider_with_account_auth, tee_stream_boxerror,
-        watchdog_stream,
+        prepare_upstream_request, provider_with_account_auth, tee_stream_boxerror, watchdog_stream,
     },
 };
 
@@ -54,7 +54,7 @@ fn persist_codex_response_debug_log(
     body: &serde_json::Value,
     endpoint: EndpointKind,
     provider_is_codex: bool,
- ) {
+) {
     let debug_log = build_response_debug_log(
         request_id,
         provider_id,
@@ -81,7 +81,7 @@ fn persist_codex_stream_buffer_debug_log(
     buffer: Arc<std::sync::Mutex<Vec<u8>>>,
     endpoint: EndpointKind,
     provider_is_codex: bool,
- ) {
+) {
     tokio::spawn(async move {
         let mut last_len = None;
         let mut stable_polls = 0_u8;
@@ -181,14 +181,18 @@ pub struct RoutedStream {
 
 impl RouterService {
     pub fn new(repository: Arc<SqliteRepository>) -> Self {
+        Self::with_clients(repository, ProxyClientCache::new())
+    }
+
+    pub fn with_clients(repository: Arc<SqliteRepository>, clients: ProxyClientCache) -> Self {
         let stream_idle_timeout_secs: u64 = std::env::var("KOU_STREAM_IDLE_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
         Self {
-            oauth: OAuthService::new(repository.clone()),
+            oauth: OAuthService::with_clients(repository.clone(), clients.clone()),
             repository,
-            upstream: UpstreamClient::new(),
+            upstream: UpstreamClient::with_clients(clients),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             translator: Arc::new(TranslatorRegistry::new()),
             retry_config: RetryConfig::from_env(),
@@ -392,12 +396,24 @@ impl RouterService {
                         &raw_model,
                         &prepared_request,
                         final_pt.as_ref(),
+                        selected_account
+                            .as_ref()
+                            .and_then(|account| account.proxy_url.as_deref()),
                         &self.retry_config,
                     )
                     .await
                     {
                         Ok(outcome) => outcome,
                         Err(err) => {
+                            if matches!(err, AppError::BadRequest(_))
+                                && let Some(account) = selected_account.as_ref()
+                            {
+                                tracing::warn!(
+                                    account_id = %account.id,
+                                    error = %err,
+                                    "skipping account after invalid proxy configuration"
+                                );
+                            }
                             self.repository
                                 .mark_provider_failure(&provider.id, &err.to_string())
                                 .await?;
@@ -775,7 +791,9 @@ impl RouterService {
                                 );
                                 let parsed_last_attempt_body =
                                     serde_json::from_str::<serde_json::Value>(&last_attempt_body)
-                                        .unwrap_or_else(|_| serde_json::json!({"raw": last_attempt_body}));
+                                        .unwrap_or_else(
+                                            |_| serde_json::json!({"raw": last_attempt_body}),
+                                        );
                                 persist_codex_response_debug_log(
                                     self.repository.clone(),
                                     request_id.clone(),
@@ -917,7 +935,7 @@ impl RouterService {
                     },
                 );
 
-                let (status, resp_headers, content_type, body) = self
+                let upstream_response = self
                     .upstream
                     .execute_raw_proxy(
                         &resolved_provider,
@@ -925,8 +943,40 @@ impl RouterService {
                         upstream_path,
                         payload,
                         passthrough_headers.as_ref(),
+                        selected_account
+                            .as_ref()
+                            .and_then(|account| account.proxy_url.as_deref()),
                     )
-                    .await?;
+                    .await;
+                let (status, resp_headers, content_type, body) = match upstream_response {
+                    Ok(response) => response,
+                    Err(err) => {
+                        if matches!(err, AppError::BadRequest(_))
+                            && let Some(account) = selected_account.as_ref()
+                        {
+                            tracing::warn!(
+                                account_id = %account.id,
+                                error = %err,
+                                "skipping account after invalid proxy configuration"
+                            );
+                        }
+                        self.repository
+                            .mark_provider_failure(&provider.id, &err.to_string())
+                            .await?;
+                        if let Some(account) = selected_account.as_ref() {
+                            self.repository
+                                .mark_provider_account_failure(&account.id, &err.to_string())
+                                .await?;
+                        }
+                        last_error = Some(RawRoutedResponse {
+                            status: reqwest::StatusCode::BAD_GATEWAY,
+                            body: err.to_string().into_bytes(),
+                            content_type: Some("text/plain".to_owned()),
+                            response_headers: Vec::new(),
+                        });
+                        continue;
+                    }
+                };
                 let body_text = String::from_utf8_lossy(&body).to_string();
                 let parsed_body = serde_json::from_slice::<serde_json::Value>(&body)
                     .unwrap_or_else(|_| serde_json::json!({"raw": body_text.clone()}));
@@ -1354,10 +1404,10 @@ fn normalize_request(
             }
         }
         EndpointKind::Messages => {
-            if object.get("messages").is_none() {
-                if let Some(input) = object.get("input").cloned() {
-                    object.insert("messages".to_string(), input);
-                }
+            if object.get("messages").is_none()
+                && let Some(input) = object.get("input").cloned()
+            {
+                object.insert("messages".to_string(), input);
             }
             object
                 .entry("stream".to_string())
@@ -1487,7 +1537,6 @@ fn normalize_request(
             ));
         }
         EndpointKind::ChatCompletions => {}
-
     }
 
     let model = object
@@ -1611,18 +1660,17 @@ fn reconstruct_responses_from_sse(body: &str) -> AppResult<serde_json::Value> {
         if event_name
             .as_deref()
             .is_some_and(|name| name.ends_with("output_item.done"))
+            && let Some(item) = value.get("item").cloned()
         {
-            if let Some(item) = value.get("item").cloned() {
-                output_items.push(item);
-            }
+            output_items.push(item);
         }
 
         if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
             synthesized_text.push_str(delta);
-        } else if synthesized_text.is_empty() {
-            if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
-                synthesized_text.push_str(text);
-            }
+        } else if synthesized_text.is_empty()
+            && let Some(text) = value.get("text").and_then(serde_json::Value::as_str)
+        {
+            synthesized_text.push_str(text);
         }
     }
 
@@ -1687,7 +1735,7 @@ fn build_response_debug_log(
     body: &serde_json::Value,
     endpoint: EndpointKind,
     provider_is_codex: bool,
- ) -> NewResponseDebugLog {
+) -> NewResponseDebugLog {
     let (reasoning_summary_json, obfuscation_count) =
         if endpoint == EndpointKind::Responses && provider_is_codex {
             (
@@ -1806,7 +1854,7 @@ fn adapt_to_responses(body: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!("resp_kou_router")),
         "object": "response",
-        "model": body.get("model").cloned().unwrap_or_else(|| serde_json::json!(null)),
+        "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "output": [{
             "type": "message",
             "role": "assistant",
@@ -1822,7 +1870,7 @@ fn adapt_to_messages(body: serde_json::Value) -> serde_json::Value {
         "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!("msg_kou_router")),
         "type": "message",
         "role": "assistant",
-        "model": body.get("model").cloned().unwrap_or_else(|| serde_json::json!(null)),
+        "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
         "raw_openai_chat": body,
@@ -1877,20 +1925,17 @@ fn find_providers_for_bare_model(
     let mut matching: Vec<_> = providers
         .iter()
         .filter(|p| {
-            // Match by inferred provider name
-            if let Some(ref inferred) = inferred_provider {
-                if p.provider == *inferred
+            if let Some(ref inferred) = inferred_provider
+                && (p.provider == *inferred
                     || p.model_prefix == *inferred
-                    || (*inferred == "anthropic" && is_anthropic_compatible_provider(p))
-                {
-                    return true;
-                }
+                    || (*inferred == "anthropic" && is_anthropic_compatible_provider(p)))
+            {
+                return true;
             }
-            // Match by default_model containing the bare model name
-            if let Some(ref default) = p.default_model {
-                if default == model || default.ends_with(&format!("/{model}")) {
-                    return true;
-                }
+            if let Some(ref default) = p.default_model
+                && (default == model || default.ends_with(&format!("/{model}")))
+            {
+                return true;
             }
             false
         })
@@ -2402,15 +2447,30 @@ mod tests {
 
     #[test]
     fn test_supports_endpoint_chat_family_matches_chat_capability() {
-        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::ChatCompletions));
-        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::Responses));
-        assert!(supports_endpoint(&["chat".to_string()], EndpointKind::Messages));
+        assert!(supports_endpoint(
+            &["chat".to_string()],
+            EndpointKind::ChatCompletions
+        ));
+        assert!(supports_endpoint(
+            &["chat".to_string()],
+            EndpointKind::Responses
+        ));
+        assert!(supports_endpoint(
+            &["chat".to_string()],
+            EndpointKind::Messages
+        ));
     }
 
     #[test]
     fn test_supports_endpoint_files_capability() {
-        assert!(supports_endpoint(&["files".to_string()], EndpointKind::Files));
-        assert!(!supports_endpoint(&["messages".to_string()], EndpointKind::Files));
+        assert!(supports_endpoint(
+            &["files".to_string()],
+            EndpointKind::Files
+        ));
+        assert!(!supports_endpoint(
+            &["messages".to_string()],
+            EndpointKind::Files
+        ));
     }
 
     #[test]
@@ -2447,9 +2507,13 @@ mod tests {
             updated_at: chrono::Utc::now(),
             protocol_format: Some("claude".to_string()),
         };
-        let matching = find_providers_for_bare_model(&[provider.clone()], "claude-sonnet-4.6");
+        let matching =
+            find_providers_for_bare_model(std::slice::from_ref(&provider), "claude-sonnet-4.6");
         assert_eq!(matching.len(), 1);
-        assert!(!supports_endpoint(&matching[0].supported_endpoints, EndpointKind::Files));
+        assert!(!supports_endpoint(
+            &matching[0].supported_endpoints,
+            EndpointKind::Files
+        ));
     }
 
     #[test]
@@ -2790,6 +2854,4 @@ mod tests {
         assert!(targets[0].1.is_none());
         assert_eq!(targets[0].0.id, provider.id);
     }
-
-
 }

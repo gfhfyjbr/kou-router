@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use reqwest::Client;
 use serde::Serialize;
 
 use crate::{
@@ -9,6 +8,7 @@ use crate::{
     models::{
         NewOAuthSession, NewProviderAccount, OAuthSession, ProviderAccount, ProviderAccountAuthMode,
     },
+    proxy::{self, ProxyClientCache},
     repository::SqliteRepository,
 };
 
@@ -17,7 +17,7 @@ use super::{OAuthTokenGrant, claude, codex, generate_pkce, generate_state};
 #[derive(Clone)]
 pub struct OAuthService {
     repository: Arc<SqliteRepository>,
-    client: Client,
+    clients: ProxyClientCache,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +25,7 @@ pub struct OAuthStartAuthorizationRequest {
     pub provider_connection_id: String,
     pub provider_account_id: Option<String>,
     pub redirect_uri: String,
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,9 +42,13 @@ pub struct OAuthStartAuthorizationResponse {
 
 impl OAuthService {
     pub fn new(repository: Arc<SqliteRepository>) -> Self {
+        Self::with_clients(repository, ProxyClientCache::new())
+    }
+
+    pub fn with_clients(repository: Arc<SqliteRepository>, clients: ProxyClientCache) -> Self {
         Self {
             repository,
-            client: Client::new(),
+            clients,
         }
     }
 
@@ -64,6 +69,12 @@ impl OAuthService {
             })?;
 
         let provider = OAuthProvider::from_provider_id(&provider_connection.provider)?;
+        let proxy_url = normalize_proxy_url(request.proxy_url.as_deref())?;
+        if let Some(provider_account_id) = request.provider_account_id.as_deref() {
+            self.repository
+                .update_provider_account_proxy(provider_account_id, proxy_url.as_deref())
+                .await?;
+        }
         let pkce = generate_pkce();
         let state = generate_state();
         let scopes = provider.default_scopes();
@@ -78,6 +89,7 @@ impl OAuthService {
                 redirect_uri: request.redirect_uri,
                 code_verifier: pkce.code_verifier,
                 scopes: Some(scopes),
+                proxy_url,
                 expires_at: Utc::now() + Duration::minutes(10),
             })
             .await?;
@@ -119,8 +131,9 @@ impl OAuthService {
                 ))
             })?;
         let provider = OAuthProvider::from_provider_id(&provider_connection.provider)?;
+        let client = self.clients.for_optional(session.proxy_url.as_deref())?;
         let token_grant = provider
-            .exchange_authorization_code(&self.client, &session, &request.code)
+            .exchange_authorization_code(&client, &session, &request.code)
             .await?;
         let scopes = token_grant
             .scopes
@@ -154,6 +167,9 @@ impl OAuthService {
                 return Err(AppError::NotFound(format!("provider account {account_id}")));
             }
             self.repository
+                .update_provider_account_proxy(account_id, session.proxy_url.as_deref())
+                .await?;
+            self.repository
                 .get_provider_account(account_id)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("provider account {account_id}")))?
@@ -175,6 +191,7 @@ impl OAuthService {
                     remote_email: token_grant.remote_email.clone(),
                     enabled: true,
                     priority: None,
+                    proxy_url: session.proxy_url.clone(),
                 })
                 .await?
         };
@@ -213,11 +230,9 @@ impl OAuthService {
                 ))
             })?;
         let provider = OAuthProvider::from_provider_id(&provider_connection.provider)?;
+        let client = self.clients.for_optional(account.proxy_url.as_deref())?;
 
-        let token_grant = match provider
-            .refresh_access_token(&self.client, &refresh_token)
-            .await
-        {
+        let token_grant = match provider.refresh_access_token(&client, &refresh_token).await {
             Ok(grant) => grant,
             Err(err) => {
                 self.repository
@@ -265,6 +280,16 @@ impl OAuthService {
     }
 }
 
+fn normalize_proxy_url(proxy_url: Option<&str>) -> AppResult<Option<String>> {
+    match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            proxy::parse_and_validate(value)?;
+            Ok(Some(value.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum OAuthProvider {
     Codex,
@@ -309,7 +334,7 @@ impl OAuthProvider {
 
     async fn exchange_authorization_code(
         self,
-        client: &Client,
+        client: &reqwest::Client,
         session: &OAuthSession,
         code: &str,
     ) -> AppResult<OAuthTokenGrant> {
@@ -321,7 +346,7 @@ impl OAuthProvider {
 
     async fn refresh_access_token(
         self,
-        client: &Client,
+        client: &reqwest::Client,
         refresh_token: &str,
     ) -> AppResult<OAuthTokenGrant> {
         match self {
