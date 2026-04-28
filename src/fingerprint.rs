@@ -2,6 +2,30 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Identifies the kind of upstream provider, used by fingerprint header logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// Anthropic 1P (api.anthropic.com).
+    FirstParty,
+    /// Azure Foundry (services.ai.azure.com).
+    Foundry,
+    /// Google Vertex AI (aiplatform.googleapis.com).
+    Vertex,
+    /// AWS Bedrock (amazonaws.com).
+    Bedrock,
+    /// Anything else (3P proxies, OpenRouter, etc.).
+    Other,
+}
+
+/// OAuth context propagated to fingerprint injection.
+#[derive(Debug, Clone, Default)]
+pub struct OAuthContext {
+    /// remote_account_id for Anthropic OAuth (UUID account.uuid).
+    pub account_uuid: Option<String>,
+    /// true ⇒ add `oauth-2025-04-20` beta in the 1P branch.
+    pub is_oauth_subscriber: bool,
+}
+
 /// Generates Claude Code fingerprints and headers for Anthropic API requests.
 /// When a non-Claude-Code client sends a request that gets routed to an Anthropic
 /// upstream provider, this module injects the necessary headers, attribution,
@@ -24,8 +48,18 @@ pub struct ClaudeCodeFingerprint {
     workload: Option<String>,
     /// Optional agent-sdk version for User-Agent (configurable via KOU_CC_AGENT_SDK_VERSION)
     agent_sdk_version: Option<String>,
-    /// Optional client-app identifier for User-Agent (configurable via KOU_CC_CLIENT_APP)
+    /// Optional client-app identifier for User-Agent (configurable via CLAUDE_CODE_CLIENT_APP or KOU_CC_CLIENT_APP)
     client_app: Option<String>,
+    /// Whether to send x-anthropic-additional-protection header
+    /// (env CLAUDE_CODE_ADDITIONAL_PROTECTION or KOU_CC_ADDITIONAL_PROTECTION).
+    additional_protection: bool,
+    /// Remote container id (env CLAUDE_CODE_CONTAINER_ID or KOU_CC_REMOTE_CONTAINER_ID).
+    remote_container_id: Option<String>,
+    /// Remote session id (env CLAUDE_CODE_REMOTE_SESSION_ID or KOU_CC_REMOTE_SESSION_ID).
+    remote_session_id: Option<String>,
+    /// Custom headers parsed from env ANTHROPIC_CUSTOM_HEADERS or KOU_CC_CUSTOM_HEADERS
+    /// (newline-separated `Name: Value`).
+    custom_headers: Vec<(String, String)>,
 }
 
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -46,9 +80,18 @@ impl ClaudeCodeFingerprint {
         let agent_sdk_version = std::env::var("KOU_CC_AGENT_SDK_VERSION")
             .ok()
             .filter(|v| !v.is_empty());
-        let client_app = std::env::var("KOU_CC_CLIENT_APP")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let client_app = read_env_first(&["CLAUDE_CODE_CLIENT_APP", "KOU_CC_CLIENT_APP"]);
+        let additional_protection = read_env_bool(&[
+            "CLAUDE_CODE_ADDITIONAL_PROTECTION",
+            "KOU_CC_ADDITIONAL_PROTECTION",
+        ]);
+        let remote_container_id =
+            read_env_first(&["CLAUDE_CODE_CONTAINER_ID", "KOU_CC_REMOTE_CONTAINER_ID"]);
+        let remote_session_id =
+            read_env_first(&["CLAUDE_CODE_REMOTE_SESSION_ID", "KOU_CC_REMOTE_SESSION_ID"]);
+        let custom_headers = read_env_first(&["ANTHROPIC_CUSTOM_HEADERS", "KOU_CC_CUSTOM_HEADERS"])
+            .map(|raw| parse_custom_headers(&raw))
+            .unwrap_or_default();
 
         // Device ID: stable per-machine, persisted to ~/.config/kou-router/device_id.
         // Can be overridden via KOU_CC_DEVICE_ID env var.
@@ -67,6 +110,10 @@ impl ClaudeCodeFingerprint {
             workload,
             agent_sdk_version,
             client_app,
+            additional_protection,
+            remote_container_id,
+            remote_session_id,
+            custom_headers,
         }
     }
 
@@ -118,12 +165,12 @@ impl ClaudeCodeFingerprint {
     ///
     /// Returns a JSON-encoded string (not an object!) containing:
     /// - device_id: 64 hex chars
-    /// - account_uuid: empty string (no OAuth)
+    /// - account_uuid: `account_uuid` if provided (Anthropic OAuth UUID), otherwise empty string
     /// - session_id: same as X-Claude-Code-Session-Id
-    pub fn metadata_user_id(&self) -> String {
+    pub fn metadata_user_id(&self, account_uuid: Option<&str>) -> String {
         let obj = json!({
             "device_id": self.device_id,
-            "account_uuid": "",
+            "account_uuid": account_uuid.unwrap_or(""),
             "session_id": self.session_id,
         });
         // Return as a JSON string, not an object
@@ -132,8 +179,9 @@ impl ClaudeCodeFingerprint {
 
     /// Return the beta headers string for the given model.
     ///
-    /// `is_first_party` indicates whether the target provider is Anthropic 1P API.
-    /// Some betas are only valid on 1P and sending them to 3P providers may cause errors.
+    /// `kind` indicates the upstream provider class. "1P" beta semantics here mean
+    /// `kind \in {FirstParty, Foundry}`. Some betas are only valid on 1P and sending
+    /// them to 3P providers may cause errors.
     ///
     /// Betas included:
     /// - claude-code-20250219 (non-Haiku)
@@ -151,8 +199,15 @@ impl ClaudeCodeFingerprint {
     /// - advanced-tool-use-2025-11-20 (1P only, tool search)
     /// - tool-search-tool-2025-10-19 (3P only, tool search)
     /// - cli-internal-2026-02-09 (1P only, ant-internal, gated by KOU_CC_ANT_INTERNAL)
-    /// - oauth-2025-04-20 (1P only, OAuth subscribers, gated by KOU_CC_OAUTH)
-    pub fn beta_headers(&self, model: &str, is_first_party: bool) -> String {
+    /// - oauth-2025-04-20 (1P only, when oauth.is_oauth_subscriber=true)
+    /// - web-search-2025-03-05 (Vertex + Claude 4+ only)
+    pub fn beta_headers(
+        &self,
+        model: &str,
+        kind: ProviderKind,
+        oauth: Option<&OAuthContext>,
+    ) -> String {
+        let is_first_party = matches!(kind, ProviderKind::FirstParty | ProviderKind::Foundry);
         let model_lower = model.to_lowercase();
 
         let is_haiku = model_lower.contains("haiku");
@@ -229,11 +284,8 @@ impl ClaudeCodeFingerprint {
                 }
             }
 
-            // oauth: Only for OAuth subscribers. Gated behind KOU_CC_OAUTH env var.
-            if std::env::var("KOU_CC_OAUTH")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false)
-            {
+            // oauth: only for OAuth subscribers (Anthropic 1P-only beta).
+            if oauth.is_some_and(|o| o.is_oauth_subscriber) {
                 betas.push("oauth-2025-04-20");
             }
         } else {
@@ -242,8 +294,13 @@ impl ClaudeCodeFingerprint {
                 betas.push("context-management-2025-06-27");
             }
 
-            // tool-search: 3P (Vertex/Bedrock) gets different beta name
+            // tool-search: 3P (Vertex/Bedrock/Other) gets different beta name
             betas.push("tool-search-tool-2025-10-19");
+
+            // web-search: Vertex-only 3P beta, Claude 4+ models.
+            if kind == ProviderKind::Vertex && is_claude4_plus {
+                betas.push("web-search-2025-03-05");
+            }
         }
 
         betas.join(",")
@@ -252,8 +309,15 @@ impl ClaudeCodeFingerprint {
     /// Generate all passthrough headers that a Claude Code client would send.
     /// Returns a Vec of (header_name, header_value) pairs.
     ///
-    /// `is_first_party` controls which beta headers are included.
-    pub fn generate_headers(&self, model: &str, is_first_party: bool) -> Vec<(String, String)> {
+    /// `kind` controls which beta headers are included and whether x-client-request-id is sent.
+    /// `oauth` propagates Anthropic OAuth subscriber state into the beta-headers set.
+    pub fn generate_headers(
+        &self,
+        model: &str,
+        kind: ProviderKind,
+        oauth: Option<&OAuthContext>,
+    ) -> Vec<(String, String)> {
+        let is_first_party = matches!(kind, ProviderKind::FirstParty | ProviderKind::Foundry);
         let mut headers = Vec::new();
 
         headers.push(("x-app".to_string(), "cli".to_string()));
@@ -302,8 +366,28 @@ impl ClaudeCodeFingerprint {
         }
         headers.push((
             "anthropic-beta".to_string(),
-            self.beta_headers(model, is_first_party),
+            self.beta_headers(model, kind, oauth),
         ));
+
+        // Optional Claude Code identity headers (only when configured via env).
+        if let Some(app) = &self.client_app {
+            headers.push(("x-client-app".to_string(), app.clone()));
+        }
+        if self.additional_protection {
+            headers.push((
+                "x-anthropic-additional-protection".to_string(),
+                "true".to_string(),
+            ));
+        }
+        if let Some(id) = &self.remote_container_id {
+            headers.push(("x-claude-remote-container-id".to_string(), id.clone()));
+        }
+        if let Some(id) = &self.remote_session_id {
+            headers.push(("x-claude-remote-session-id".to_string(), id.clone()));
+        }
+        for (name, value) in &self.custom_headers {
+            headers.push((name.clone(), value.clone()));
+        }
 
         headers
     }
@@ -339,7 +423,13 @@ impl ClaudeCodeFingerprint {
     ///
     /// `body` is the translated body in Claude format.
     /// `messages_source` is used to extract the first user message for fingerprint computation.
-    pub fn inject_body(&self, body: &mut Value, messages_source: &Value) {
+    pub fn inject_body(
+        &self,
+        body: &mut Value,
+        messages_source: &Value,
+        oauth: Option<&OAuthContext>,
+    ) {
+        let oauth_uuid = oauth.and_then(|o| o.account_uuid.as_deref());
         // Determine where to get messages from
         let messages = if messages_source.get("messages").is_some() {
             &messages_source["messages"]
@@ -356,7 +446,7 @@ impl ClaudeCodeFingerprint {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                         if text.starts_with("x-anthropic-billing-header") {
                             // Attribution already present — skip system injection
-                            self.inject_metadata(body);
+                            self.inject_metadata(body, oauth_uuid);
                             return;
                         }
                     }
@@ -365,7 +455,7 @@ impl ClaudeCodeFingerprint {
             // system might be a string (OpenAI-style), handle that too
             if let Some(text) = system.as_str() {
                 if text.starts_with("x-anthropic-billing-header") {
-                    self.inject_metadata(body);
+                    self.inject_metadata(body, oauth_uuid);
                     return;
                 }
             }
@@ -391,16 +481,16 @@ impl ClaudeCodeFingerprint {
             body["system"] = json!([{"type": "text", "text": attribution}]);
         }
 
-        self.inject_metadata(body);
+        self.inject_metadata(body, oauth_uuid);
     }
 
     /// Inject metadata.user_id into the body if not already present.
-    fn inject_metadata(&self, body: &mut Value) {
+    fn inject_metadata(&self, body: &mut Value, account_uuid: Option<&str>) {
         if body.get("metadata").is_none() {
-            body["metadata"] = json!({"user_id": self.metadata_user_id()});
+            body["metadata"] = json!({"user_id": self.metadata_user_id(account_uuid)});
         } else if let Some(meta) = body.get_mut("metadata") {
             if meta.get("user_id").is_none() {
-                meta["user_id"] = json!(self.metadata_user_id());
+                meta["user_id"] = json!(self.metadata_user_id(account_uuid));
             }
         }
     }
@@ -443,6 +533,8 @@ fn is_claude4_or_newer(model_lower: &str) -> bool {
         // Generic future-proofing
         || model_lower.contains("claude-sonnet-4")
         || model_lower.contains("claude-opus-4")
+        || model_lower.contains("haiku-4")
+        || model_lower.contains("claude-haiku-4")
 }
 
 /// Check if a model name suggests Claude 4.5 or newer (for structured-outputs beta).
@@ -458,13 +550,16 @@ fn is_claude45_or_newer(model_lower: &str) -> bool {
         || model_lower.contains("claude-6")
 }
 
-/// Check if a model supports 1M extended context.
-/// In Claude Code, this is determined by `has1mContext(model)` which checks against
-/// a list of specific model IDs. Claude 4+ models generally support 1M context,
-/// while Claude 3.x models are limited to 200K.
+/// Check if a model has 1M extended context enabled — mirrors canonical Claude Code
+/// `has1mContext`: explicit `[1m]` suffix in the model name is the only opt-in.
+/// Anthropic gates the `context-1m-2025-08-07` beta on this; OAuth subscribers
+/// without 1M entitlement get a 400 if the beta is sent unconditionally.
+/// Disabled entirely when `CLAUDE_CODE_DISABLE_1M_CONTEXT` / `KOU_CC_DISABLE_1M_CONTEXT` is truthy.
 fn has_1m_context(model_lower: &str) -> bool {
-    // Claude 4+ models have 1M context support
-    is_claude4_or_newer(model_lower)
+    if read_env_bool(&["CLAUDE_CODE_DISABLE_1M_CONTEXT", "KOU_CC_DISABLE_1M_CONTEXT"]) {
+        return false;
+    }
+    model_lower.contains("[1m]")
 }
 
 /// Simple getrandom using rand crate (already a dependency)
@@ -533,6 +628,50 @@ fn device_id_path() -> Option<std::path::PathBuf> {
     })
 }
 
+/// Read the first non-empty env var from `names`, returning the trimmed value.
+fn read_env_first(names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read a boolean env var, treating any non-falsy value as true.
+fn read_env_bool(names: &[&str]) -> bool {
+    if let Some(v) = read_env_first(names) {
+        let lower = v.to_ascii_lowercase();
+        lower != "0" && lower != "false" && lower != "no" && lower != "off"
+    } else {
+        false
+    }
+}
+
+/// Parse newline-separated `Name: Value` lines into header pairs.
+/// Empty lines, lines without `:`, and lines with empty name/value are skipped.
+/// Only the first `:` is treated as the separator (values may contain `:`).
+fn parse_custom_headers(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (name, value) = line.split_once(':')?;
+            let name = name.trim();
+            let value = value.trim();
+            if name.is_empty() || value.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +689,10 @@ mod tests {
             workload: None,
             agent_sdk_version: None,
             client_app: None,
+            additional_protection: false,
+            remote_container_id: None,
+            remote_session_id: None,
+            custom_headers: vec![],
         }
     }
 
@@ -652,7 +795,7 @@ mod tests {
     #[test]
     fn test_metadata_user_id_format() {
         let fp = test_fingerprint();
-        let user_id = fp.metadata_user_id();
+        let user_id = fp.metadata_user_id(None);
 
         // Should be a valid JSON string
         let parsed: Value = serde_json::from_str(&user_id).unwrap();
@@ -667,7 +810,7 @@ mod tests {
     #[test]
     fn test_beta_headers_non_haiku_1p() {
         let fp = test_fingerprint();
-        let betas = fp.beta_headers("claude-sonnet-4-20250514", true);
+        let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
         assert!(betas.contains("claude-code-20250219"));
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(betas.contains("redact-thinking-2026-02-12"));
@@ -678,7 +821,8 @@ mod tests {
         assert!(betas.contains("fast-mode-2026-02-01"));
         assert!(betas.contains("task-budgets-2026-03-13"));
         assert!(betas.contains("advisor-tool-2026-03-01"));
-        assert!(betas.contains("context-1m-2025-08-07"));
+        // context-1m gates on `[1m]` suffix (canonical Claude Code behavior); plain Sonnet 4 has no opt-in.
+        assert!(!betas.contains("context-1m-2025-08-07"));
         assert!(betas.contains("afk-mode-2026-01-31"));
         assert!(betas.contains("advanced-tool-use-2025-11-20"));
         // 1P should NOT have 3P tool-search beta
@@ -688,7 +832,7 @@ mod tests {
     #[test]
     fn test_beta_headers_haiku_1p() {
         let fp = test_fingerprint();
-        let betas = fp.beta_headers("claude-3-5-haiku-20241022", true);
+        let betas = fp.beta_headers("claude-3-5-haiku-20241022", ProviderKind::FirstParty, None);
         // Haiku should NOT have claude-code beta
         assert!(!betas.contains("claude-code-20250219"));
         // claude-3-* should NOT have interleaved-thinking
@@ -708,7 +852,7 @@ mod tests {
     #[test]
     fn test_beta_headers_claude35_1p() {
         let fp = test_fingerprint();
-        let betas = fp.beta_headers("claude-3-5-sonnet-20241022", true);
+        let betas = fp.beta_headers("claude-3-5-sonnet-20241022", ProviderKind::FirstParty, None);
         assert!(betas.contains("claude-code-20250219"));
         // claude-3-* should NOT have interleaved-thinking
         assert!(!betas.contains("interleaved-thinking-2025-05-14"));
@@ -725,7 +869,7 @@ mod tests {
     #[test]
     fn test_beta_headers_3p_provider() {
         let fp = test_fingerprint();
-        let betas = fp.beta_headers("claude-sonnet-4-20250514", false);
+        let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::Other, None);
         assert!(betas.contains("claude-code-20250219"));
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(betas.contains("effort-2025-11-24"));
@@ -746,10 +890,10 @@ mod tests {
     fn test_beta_headers_structured_outputs() {
         let fp = test_fingerprint();
         // Claude 4.5+ should get structured-outputs on 1P
-        let betas = fp.beta_headers("claude-sonnet-4-5-20250514", true);
+        let betas = fp.beta_headers("claude-sonnet-4-5-20250514", ProviderKind::FirstParty, None);
         assert!(betas.contains("structured-outputs-2025-12-15"));
         // Claude 4.0 should NOT
-        let betas = fp.beta_headers("claude-sonnet-4-20250514", true);
+        let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
         assert!(!betas.contains("structured-outputs-2025-12-15"));
     }
 
@@ -801,7 +945,7 @@ mod tests {
             "system": [{"type": "text", "text": "You are helpful."}]
         });
         let messages_source = body.clone();
-        fp.inject_body(&mut body, &messages_source);
+        fp.inject_body(&mut body, &messages_source, None);
 
         let system = body["system"].as_array().unwrap();
         assert_eq!(system.len(), 2); // attribution + original
@@ -828,7 +972,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         });
         let messages_source = body.clone();
-        fp.inject_body(&mut body, &messages_source);
+        fp.inject_body(&mut body, &messages_source, None);
 
         let system = body["system"].as_array().unwrap();
         assert_eq!(system.len(), 1);
@@ -851,7 +995,7 @@ mod tests {
             "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.88.abc; cc_entrypoint=cli;"}]
         });
         let messages_source = body.clone();
-        fp.inject_body(&mut body, &messages_source);
+        fp.inject_body(&mut body, &messages_source, None);
 
         // Should NOT have added another attribution block
         let system = body["system"].as_array().unwrap();
@@ -867,7 +1011,7 @@ mod tests {
             "metadata": {"some_key": "some_value"}
         });
         let messages_source = body.clone();
-        fp.inject_body(&mut body, &messages_source);
+        fp.inject_body(&mut body, &messages_source, None);
 
         // Should add user_id but not overwrite existing metadata
         assert_eq!(body["metadata"]["some_key"].as_str().unwrap(), "some_value");
@@ -877,7 +1021,7 @@ mod tests {
     #[test]
     fn test_generate_headers() {
         let fp = test_fingerprint();
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", true);
+        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let find = |name: &str| -> Option<String> {
             headers
@@ -904,7 +1048,7 @@ mod tests {
     #[test]
     fn test_generate_headers_3p_no_client_request_id() {
         let fp = test_fingerprint();
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", false);
+        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::Other, None);
 
         let find = |name: &str| -> Option<String> {
             headers
@@ -928,7 +1072,7 @@ mod tests {
     fn test_generate_headers_with_workload() {
         let mut fp = test_fingerprint();
         fp.workload = Some("cron-task".to_string());
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", true);
+        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let ua = headers
             .iter()
@@ -948,7 +1092,7 @@ mod tests {
         fp.agent_sdk_version = Some("0.1.17".to_string());
         fp.client_app = Some("my-app".to_string());
         fp.workload = Some("cron".to_string());
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", true);
+        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let ua = headers
             .iter()
@@ -1045,4 +1189,191 @@ mod tests {
         assert!(!is_claude45_or_newer("claude-opus-4-20250514"));
         assert!(!is_claude45_or_newer("claude-3-5-sonnet-20241022"));
     }
+
+    #[test]
+    fn test_is_claude4_or_newer_haiku4() {
+        assert!(is_claude4_or_newer("claude-haiku-4-5-20250514"));
+        assert!(is_claude4_or_newer("haiku-4-latest"));
+        // Не должен матчить старый 3-5-haiku
+        assert!(!is_claude4_or_newer("claude-3-5-haiku-20241022"));
+    }
+
+    #[test]
+    fn test_beta_headers_vertex_claude4_has_web_search() {
+        let fp = test_fingerprint();
+        let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::Vertex, None);
+        assert!(betas.contains("web-search-2025-03-05"), "betas: {betas}");
+        // 3P-only beta присутствует
+        assert!(betas.contains("tool-search-tool-2025-10-19"));
+        // 1P-only беты отсутствуют
+        assert!(!betas.contains("prompt-caching-scope-2026-01-05"));
+        assert!(!betas.contains("oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn test_beta_headers_3p_no_oauth_beta() {
+        let fp = test_fingerprint();
+        // OAuth flag не должен включать беты в 3P-ветке
+        let oauth = OAuthContext {
+            account_uuid: Some("x".into()),
+            is_oauth_subscriber: true,
+        };
+        let betas =
+            fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::Other, Some(&oauth));
+        assert!(!betas.contains("oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn test_beta_headers_oauth_subscriber_includes_oauth_beta() {
+        let fp = test_fingerprint();
+        let oauth = OAuthContext {
+            account_uuid: Some("abc".into()),
+            is_oauth_subscriber: true,
+        };
+        let betas =
+            fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, Some(&oauth));
+        assert!(betas.contains("oauth-2025-04-20"), "betas: {betas}");
+    }
+
+    #[test]
+    fn test_beta_headers_oauth_haiku_no_claude_code_but_oauth() {
+        let fp = test_fingerprint();
+        let oauth = OAuthContext {
+            account_uuid: None,
+            is_oauth_subscriber: true,
+        };
+        let betas =
+            fp.beta_headers("claude-3-5-haiku-20241022", ProviderKind::FirstParty, Some(&oauth));
+        // Haiku не получает claude-code
+        assert!(!betas.contains("claude-code-20250219"));
+        // Но OAuth-beta включена
+        assert!(betas.contains("oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn test_metadata_user_id_with_account_uuid() {
+        let fp = test_fingerprint();
+        let user_id = fp.metadata_user_id(Some("acc-uuid-1234"));
+        let parsed: Value = serde_json::from_str(&user_id).unwrap();
+        assert_eq!(parsed["account_uuid"].as_str().unwrap(), "acc-uuid-1234");
+        let user_id_empty = fp.metadata_user_id(None);
+        let parsed_empty: Value = serde_json::from_str(&user_id_empty).unwrap();
+        assert_eq!(parsed_empty["account_uuid"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_inject_body_with_oauth_context_sets_account_uuid() {
+        let fp = test_fingerprint();
+        let mut body = json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let messages_source = body.clone();
+        let oauth = OAuthContext {
+            account_uuid: Some("acc-99".into()),
+            is_oauth_subscriber: true,
+        };
+        fp.inject_body(&mut body, &messages_source, Some(&oauth));
+        let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
+        let user_id: Value = serde_json::from_str(user_id_str).unwrap();
+        assert_eq!(user_id["account_uuid"].as_str().unwrap(), "acc-99");
+    }
+
+    #[test]
+    fn test_generate_headers_with_additional_protection() {
+        let mut fp = test_fingerprint();
+        fp.additional_protection = true;
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        let v = headers
+            .iter()
+            .find(|(n, _)| n == "x-anthropic-additional-protection")
+            .map(|(_, v)| v.clone());
+        assert_eq!(v.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_generate_headers_custom_headers() {
+        let mut fp = test_fingerprint();
+        fp.custom_headers = vec![
+            ("X-Foo".into(), "bar".into()),
+            ("X-Baz".into(), "qux".into()),
+        ];
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(n, _)| n == "X-Foo")
+                .map(|(_, v)| v.as_str()),
+            Some("bar"),
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(n, _)| n == "X-Baz")
+                .map(|(_, v)| v.as_str()),
+            Some("qux"),
+        );
+    }
+
+    #[test]
+    fn test_generate_headers_remote_container_and_session_ids() {
+        let mut fp = test_fingerprint();
+        fp.remote_container_id = Some("container-xyz".into());
+        fp.remote_session_id = Some("remote-session-1".into());
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(n, _)| n == "x-claude-remote-container-id")
+                .map(|(_, v)| v.as_str()),
+            Some("container-xyz"),
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(n, _)| n == "x-claude-remote-session-id")
+                .map(|(_, v)| v.as_str()),
+            Some("remote-session-1"),
+        );
+    }
+
+    #[test]
+    fn test_parse_custom_headers_basic() {
+        let parsed = parse_custom_headers("X-Foo: bar\nX-Baz: qux\n\n  X-Trim:  spaces  ");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], ("X-Foo".to_string(), "bar".to_string()));
+        assert_eq!(parsed[1], ("X-Baz".to_string(), "qux".to_string()));
+        assert_eq!(parsed[2], ("X-Trim".to_string(), "spaces".to_string()));
+    }
+
+    #[test]
+    fn test_parse_custom_headers_value_with_colon() {
+        let parsed = parse_custom_headers("Authorization: Bearer abc:def");
+        assert_eq!(
+            parsed,
+            vec![("Authorization".to_string(), "Bearer abc:def".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_has_1m_context_requires_explicit_suffix() {
+        // canonical Claude Code: only the `[1m]` suffix opts a model into 1M context
+        assert!(!has_1m_context("claude-sonnet-4-5-20250929"));
+        assert!(!has_1m_context("claude-opus-4-5"));
+        assert!(has_1m_context("claude-sonnet-4-5-20250929[1m]"));
+        assert!(has_1m_context("claude-opus-4-6[1m]"));
+    }
+
+    #[test]
+    fn test_beta_headers_context_1m_only_with_suffix() {
+        let fp = test_fingerprint();
+        let plain = fp.beta_headers("claude-sonnet-4-5-20250929", ProviderKind::FirstParty, None);
+        assert!(!plain.contains("context-1m-2025-08-07"));
+        let opt_in = fp.beta_headers("claude-sonnet-4-5-20250929[1m]", ProviderKind::FirstParty, None);
+        assert!(opt_in.contains("context-1m-2025-08-07"));
+    }
+
 }

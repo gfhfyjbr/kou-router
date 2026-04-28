@@ -81,10 +81,28 @@ structured-outputs и т.д.), и инжектит `metadata.user_id` в body. �
 | `KOU_CC_USER_TYPE` | `external` | `external` / `internal` (Anthropic employees) |
 | `KOU_CC_WORKLOAD` | — | Тег для billing attribution (e.g. `cron-task`) |
 | `KOU_CC_AGENT_SDK_VERSION` | — | Версия Agent SDK, добавляется в UA |
-| `KOU_CC_CLIENT_APP` | — | Свой `client-app/...` маркер в UA |
 | `KOU_CC_DEVICE_ID` | auto | Переопределить device_id (ровно 64 hex chars). По умолчанию генерится один раз и кешируется в `~/.config/kou-router/device_id` |
 | `KOU_CC_ANT_INTERNAL` | `0` | Включить ant-internal beta `cli-internal-2026-02-09` |
-| `KOU_CC_OAUTH` | `0` | Включить `oauth-2025-04-20` beta (для OAuth-подписчиков) |
+| `CLAUDE_CODE_ADDITIONAL_PROTECTION` / `KOU_CC_ADDITIONAL_PROTECTION` | — | Truthy → отправить заголовок `x-anthropic-additional-protection: true` (для Anthropic-environment-restricted clients) |
+| `CLAUDE_CODE_CONTAINER_ID` / `KOU_CC_REMOTE_CONTAINER_ID` | — | Значение заголовка `x-claude-remote-container-id` (для Claude Code remote-container режима) |
+| `CLAUDE_CODE_REMOTE_SESSION_ID` / `KOU_CC_REMOTE_SESSION_ID` | — | Значение `x-claude-remote-session-id` |
+| `CLAUDE_CODE_CLIENT_APP` / `KOU_CC_CLIENT_APP` | — | Свой `client-app/...` маркер в UA и отдельный заголовок `x-client-app` |
+| `ANTHROPIC_CUSTOM_HEADERS` / `KOU_CC_CUSTOM_HEADERS` | — | newline-separated `Name: Value` пары, которые роутер добавит к каждому Anthropic-запросу (но НЕ перепишет заголовки клиента) |
+| `KOU_CC_CLAUDE_TOKEN_URL` | `https://console.anthropic.com/v1/oauth/token` | Переопределить Anthropic OAuth token endpoint (используется при exchange и refresh; предназначен для тестов) |
+
+#### Auto OAuth
+
+Если роутер проксирует запрос через `provider_account` с `auth_mode = oauth` на Anthropic 1P (provider в [`anthropic`, `claude-oauth`] или base_url с `api.anthropic.com`):
+- `anthropic-beta` автоматически включает `oauth-2025-04-20` (раньше гейт через `KOU_CC_OAUTH`).
+- `metadata.user_id.account_uuid` в body заполняется из `provider_account.remote_account_id` (который вытаскивается из token-response: `account.uuid` или JWT.sub).
+
+Для Foundry/Vertex/Bedrock OAuth бета НЕ включается — это Anthropic-специфичный флаг.
+
+#### Token refresh
+
+Для OAuth-аккаунтов роутер делает два вида refresh:
+1. **Проактивный:** если `expires_at` меньше чем через 5 минут (буфер), роутер вызывает OAuthService::refresh ДО отправки запроса.
+2. **На 401:** если апстрим всё-таки ответил 401 (ревок, server-side expiry), роутер форсирует refresh и повторяет запрос один раз. Если второй раз тоже 401 — ошибка пробрасывается клиенту.
 
 ### Тесты
 

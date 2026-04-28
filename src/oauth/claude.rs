@@ -12,6 +12,11 @@ use super::{
 
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+
+/// Token endpoint, with `KOU_CC_CLAUDE_TOKEN_URL` env override for tests.
+fn token_url() -> String {
+    std::env::var("KOU_CC_CLAUDE_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
+}
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_SCOPES: &[&str] = &[
     "user:file_upload",
@@ -56,7 +61,7 @@ pub(super) async fn exchange_authorization_code(
 ) -> AppResult<OAuthTokenGrant> {
     let code = code.split_once('#').map_or(code, |(value, _)| value);
     let response = client
-        .post(TOKEN_URL)
+        .post(token_url())
         .json(&serde_json::json!({
             "code": code,
             "state": session.state,
@@ -76,7 +81,7 @@ pub(super) async fn refresh_access_token(
     refresh_token: &str,
 ) -> AppResult<OAuthTokenGrant> {
     let response = client
-        .post(TOKEN_URL)
+        .post(token_url())
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -99,10 +104,19 @@ async fn parse_token_response(response: reqwest::Response) -> AppResult<OAuthTok
     }
 
     let token: ClaudeTokenResponse = serde_json::from_str(&body)?;
+    let access_token = token.access_token.ok_or_else(|| {
+        AppError::Upstream("claude oauth token response did not include an access token".into())
+    })?;
+
+    let account_email = token.account.as_ref().and_then(|a| a.email_address.clone());
+    let account_uuid = token
+        .account
+        .as_ref()
+        .and_then(|a| a.uuid.clone())
+        .or_else(|| extract_jwt_sub(&access_token));
+
     Ok(OAuthTokenGrant {
-        access_token: token.access_token.ok_or_else(|| {
-            AppError::Upstream("claude oauth token response did not include an access token".into())
-        })?,
+        access_token,
         refresh_token: token.refresh_token,
         expires_at: expires_at_from_now(token.expires_in),
         scopes: token
@@ -110,8 +124,8 @@ async fn parse_token_response(response: reqwest::Response) -> AppResult<OAuthTok
             .as_deref()
             .and_then(|scope| parse_scope_string(Some(scope)))
             .or(token.scopes),
-        remote_account_id: None,
-        remote_email: None,
+        remote_account_id: account_uuid,
+        remote_email: account_email,
     })
 }
 
@@ -127,4 +141,101 @@ struct ClaudeTokenResponse {
     scope: Option<String>,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    #[serde(default)]
+    account: Option<ClaudeAccountClaims>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    organization: Option<ClaudeOrgClaims>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeAccountClaims {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    email_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeOrgClaims {
+    #[serde(default)]
+    #[allow(dead_code)]
+    uuid: Option<String>,
+}
+
+/// Fallback: попытаться декодировать access_token как JWT и достать `sub` claim.
+/// Anthropic OAuth tokens — JWT с `sub` = account uuid.
+fn extract_jwt_sub(jwt: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct SubClaim {
+        #[serde(default)]
+        sub: Option<String>,
+    }
+    let claims: SubClaim = super::decode_jwt_payload(jwt).ok()?;
+    claims.sub.filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use serde_json::json;
+
+    fn make_jwt(claims: &serde_json::Value) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(b"{\"alg\":\"none\",\"typ\":\"JWT\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).unwrap());
+        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    #[test]
+    fn test_parse_token_response_extracts_account_uuid() {
+        let body = json!({
+            "access_token": "sk-ant-xxx",
+            "refresh_token": "refr-xxx",
+            "expires_in": 3600,
+            "scope": "user:profile user:inference",
+            "account": {
+                "uuid": "acc-uuid-from-response",
+                "email_address": "user@example.com"
+            },
+            "organization": { "uuid": "org-uuid-x" }
+        });
+        let token: ClaudeTokenResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            token.account.as_ref().and_then(|a| a.uuid.clone()).unwrap(),
+            "acc-uuid-from-response"
+        );
+        assert_eq!(
+            token.account.as_ref().and_then(|a| a.email_address.clone()).unwrap(),
+            "user@example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_jwt_sub_basic() {
+        let jwt = make_jwt(&json!({"sub": "acc-uuid-from-jwt"}));
+        assert_eq!(extract_jwt_sub(&jwt), Some("acc-uuid-from-jwt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_jwt_sub_missing_returns_none() {
+        let jwt = make_jwt(&json!({"exp": 1700000000}));
+        assert_eq!(extract_jwt_sub(&jwt), None);
+    }
+
+    #[test]
+    fn test_extract_jwt_sub_empty_string_returns_none() {
+        let jwt = make_jwt(&json!({"sub": ""}));
+        assert_eq!(extract_jwt_sub(&jwt), None);
+    }
+
+    #[test]
+    fn test_extract_jwt_sub_invalid_jwt_returns_none() {
+        assert_eq!(extract_jwt_sub("not-a-jwt"), None);
+        assert_eq!(extract_jwt_sub(""), None);
+        assert_eq!(extract_jwt_sub("a.b"), None);
+    }
 }

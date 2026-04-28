@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     error::{AppError, AppResult},
-    fingerprint::ClaudeCodeFingerprint,
+    fingerprint::{ClaudeCodeFingerprint, OAuthContext, ProviderKind},
     models::{
         ComboStrategy, EndpointKind, NewRequestDebugLog, NewResponseDebugLog, NormalizedRequest,
         OpenAiModelsResponse, ProviderAccount, ProviderAccountAuthMode,
@@ -347,17 +347,19 @@ impl RouterService {
 
                 for (resolved_provider, selected_account) in execution_targets {
                     let account_debug = selected_account.as_ref().map(RoutingProviderAccount::from);
+                    let provider_kind = classify_provider(&provider);
+                    let oauth_ctx = build_oauth_context(selected_account.as_ref(), provider_kind);
                     let (final_body, final_pt) = if self
                         .fingerprint
                         .needs_injection(&target_format, &passthrough_headers)
                     {
                         let mut body = provider_body.clone();
-                        self.fingerprint.inject_body(&mut body, &normalized.body);
-                        let is_first_party = is_anthropic_first_party(&provider);
+                        self.fingerprint
+                            .inject_body(&mut body, &normalized.body, oauth_ctx.as_ref());
                         let mut pt = passthrough_headers.clone().unwrap_or_default();
                         pt.merge(
                             self.fingerprint
-                                .generate_headers(&raw_model, is_first_party),
+                                .generate_headers(&raw_model, provider_kind, oauth_ctx.as_ref()),
                         );
                         (body, Some(pt))
                     } else {
@@ -389,19 +391,20 @@ impl RouterService {
                         },
                     );
 
-                    let retry_outcome = match execute_with_retry(
-                        &self.upstream,
-                        &resolved_provider,
-                        endpoint,
-                        &raw_model,
-                        &prepared_request,
-                        final_pt.as_ref(),
-                        selected_account
-                            .as_ref()
-                            .and_then(|account| account.proxy_url.as_deref()),
-                        &self.retry_config,
-                    )
-                    .await
+                    let retry_outcome = match self
+                        .execute_with_oauth_retry(
+                            &provider,
+                            &resolved_provider,
+                            selected_account.as_ref(),
+                            endpoint,
+                            &raw_model,
+                            &prepared_request,
+                            final_pt.as_ref(),
+                            selected_account
+                                .as_ref()
+                                .and_then(|account| account.proxy_url.as_deref()),
+                        )
+                        .await
                     {
                         Ok(outcome) => outcome,
                         Err(err) => {
@@ -1190,6 +1193,80 @@ impl RouterService {
         *next = next.wrapping_add(1);
         Ok(models[idx].clone())
     }
+
+    /// Execute with retry, then if upstream returned 401 on an OAuth account,
+    /// force-refresh the token and retry once. Mirrors Claude Code's `withOAuth401Retry`.
+    ///
+    /// `base_provider` is the unresolved ProviderConnection (without the access token baked in).
+    /// `resolved_provider` already has the access token from the previous resolution; if a
+    /// refresh happens, we rebuild it via `provider_with_account_auth`.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_oauth_retry(
+        &self,
+        base_provider: &crate::models::ProviderConnection,
+        resolved_provider: &crate::models::ProviderConnection,
+        account: Option<&ProviderAccount>,
+        endpoint: EndpointKind,
+        model: &str,
+        prepared: &crate::upstream::PreparedUpstreamRequest,
+        passthrough: Option<&PassthroughHeaders>,
+        proxy_url: Option<&str>,
+    ) -> AppResult<crate::retry::RetryOutcome> {
+        let outcome = execute_with_retry(
+            &self.upstream,
+            resolved_provider,
+            endpoint,
+            model,
+            prepared,
+            passthrough,
+            proxy_url,
+            &self.retry_config,
+        )
+        .await?;
+
+        let needs_oauth_refresh = matches!(
+            (account, &outcome.result),
+            (Some(a), UpstreamResult::Buffered(resp))
+                if a.auth_mode == ProviderAccountAuthMode::OAuth && resp.status.as_u16() == 401
+        );
+        if !needs_oauth_refresh {
+            return Ok(outcome);
+        }
+        let account = match account {
+            Some(a) => a,
+            None => return Ok(outcome),
+        };
+
+        tracing::warn!(
+            account_id = %account.id,
+            "upstream returned 401 on OAuth account; force-refreshing token and retrying once"
+        );
+        let fresh_account = match self.oauth.refresh_provider_account(&account.id).await {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                tracing::warn!(
+                    account_id = %account.id,
+                    error = %err,
+                    "oauth force-refresh failed after 401; returning original outcome"
+                );
+                return Ok(outcome);
+            }
+        };
+        let refreshed_provider =
+            provider_with_account_auth(base_provider, &fresh_account, &base_provider.provider);
+        execute_with_retry(
+            &self.upstream,
+            &refreshed_provider,
+            endpoint,
+            model,
+            prepared,
+            passthrough,
+            proxy_url,
+            &self.retry_config,
+        )
+        .await
+    }
+
 }
 
 fn has_secret(value: Option<&str>) -> bool {
@@ -1980,14 +2057,48 @@ fn is_anthropic_compatible_provider(provider: &crate::models::ProviderConnection
     ProtocolFormat::from_provider(provider) == ProtocolFormat::Claude
 }
 
-/// Check if a provider connection targets the Anthropic 1P API or Foundry.
-/// Used to determine which beta headers to include (some are 1P/Foundry-only).
-/// In Claude Code, Foundry (Azure) is treated as equivalent to 1P for beta headers.
-fn is_anthropic_first_party(provider: &crate::models::ProviderConnection) -> bool {
-    provider.provider.eq_ignore_ascii_case("anthropic")
-        || provider.provider.eq_ignore_ascii_case("foundry")
-        || provider.base_url.contains("api.anthropic.com")
-        || provider.base_url.contains("services.ai.azure.com")
+/// Classify a provider connection into the kind enum used by fingerprint header logic.
+fn classify_provider(provider: &crate::models::ProviderConnection) -> ProviderKind {
+    let name = provider.provider.to_ascii_lowercase();
+    let url = provider.base_url.to_ascii_lowercase();
+
+    if matches!(
+        name.as_str(),
+        "anthropic" | "claude-oauth" | "anthropic-oauth" | "claude"
+    ) || url.contains("api.anthropic.com")
+    {
+        return ProviderKind::FirstParty;
+    }
+    if name == "foundry" || url.contains("services.ai.azure.com") {
+        return ProviderKind::Foundry;
+    }
+    if name == "vertex" || url.contains("aiplatform.googleapis.com") {
+        return ProviderKind::Vertex;
+    }
+    if name == "bedrock" || url.contains("amazonaws.com") {
+        return ProviderKind::Bedrock;
+    }
+    ProviderKind::Other
+}
+
+/// Build an `OAuthContext` for fingerprint injection from the selected account + provider kind.
+/// Returns None when the account is api-key or absent (no OAuth context to propagate).
+///
+/// `is_oauth_subscriber` is true only for Anthropic 1P + OAuth account (the precondition for
+/// the `oauth-2025-04-20` Anthropic beta). Foundry/Vertex/Bedrock OAuth, even if it existed,
+/// is not Anthropic-issued and would not unlock the same beta.
+fn build_oauth_context(
+    account: Option<&ProviderAccount>,
+    kind: ProviderKind,
+) -> Option<OAuthContext> {
+    let account = account?;
+    if account.auth_mode != ProviderAccountAuthMode::OAuth {
+        return None;
+    }
+    Some(OAuthContext {
+        account_uuid: account.remote_account_id.clone(),
+        is_oauth_subscriber: kind == ProviderKind::FirstParty,
+    })
 }
 
 #[cfg(test)]
@@ -2853,5 +2964,137 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(targets[0].1.is_none());
         assert_eq!(targets[0].0.id, provider.id);
+    }
+
+    fn make_provider(name: &str, base_url: &str) -> crate::models::ProviderConnection {
+        crate::models::ProviderConnection {
+            id: "p".into(),
+            provider: name.into(),
+            base_url: base_url.into(),
+            api_key: None,
+            auth_type: "apikey".into(),
+            auth_header: "bearer".into(),
+            auth_prefix: None,
+            extra_headers: Default::default(),
+            endpoint_paths: Default::default(),
+            stream_endpoint_paths: Default::default(),
+            model_prefix: "".into(),
+            name: None,
+            enabled: true,
+            priority: 0,
+            default_model: None,
+            supported_endpoints: vec![],
+            rate_limit_protection: false,
+            last_error: None,
+            last_error_at: None,
+            last_error_type: None,
+            last_error_source: None,
+            rate_limited_until: None,
+            circuit_open_until: None,
+            last_used_at: None,
+            backoff_level: 0,
+            consecutive_use_count: 0,
+            test_status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            protocol_format: None,
+        }
+    }
+
+    #[test]
+    fn test_classify_provider_anthropic_is_first_party() {
+        let p = make_provider("anthropic", "https://api.anthropic.com");
+        assert_eq!(classify_provider(&p), ProviderKind::FirstParty);
+    }
+
+    #[test]
+    fn test_classify_provider_claude_oauth_is_first_party() {
+        let p = make_provider("claude-oauth", "https://api.anthropic.com");
+        assert_eq!(classify_provider(&p), ProviderKind::FirstParty);
+    }
+
+    #[test]
+    fn test_classify_provider_foundry() {
+        let p = make_provider("foundry", "https://east-us.services.ai.azure.com");
+        assert_eq!(classify_provider(&p), ProviderKind::Foundry);
+    }
+
+    #[test]
+    fn test_classify_provider_vertex() {
+        let p = make_provider("vertex", "https://us-east4-aiplatform.googleapis.com");
+        assert_eq!(classify_provider(&p), ProviderKind::Vertex);
+    }
+
+    #[test]
+    fn test_classify_provider_bedrock() {
+        let p = make_provider("bedrock", "https://bedrock-runtime.us-east-1.amazonaws.com");
+        assert_eq!(classify_provider(&p), ProviderKind::Bedrock);
+    }
+
+    #[test]
+    fn test_classify_provider_other() {
+        let p = make_provider("openrouter", "https://openrouter.ai/api/v1");
+        assert_eq!(classify_provider(&p), ProviderKind::Other);
+    }
+
+    fn make_account(
+        auth_mode: ProviderAccountAuthMode,
+        remote_account_id: Option<&str>,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: "a".into(),
+            provider_connection_id: "p".into(),
+            label: None,
+            auth_mode,
+            api_key: None,
+            access_token: Some("tok".into()),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: vec![],
+            remote_account_id: remote_account_id.map(str::to_string),
+            remote_email: None,
+            enabled: true,
+            priority: 0,
+            last_used_at: None,
+            rate_limited_until: None,
+            circuit_open_until: None,
+            last_error: None,
+            last_error_type: None,
+            last_refresh_at: None,
+            refresh_error: None,
+            backoff_level: 0,
+            consecutive_use_count: 0,
+            proxy_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_build_oauth_context_oauth_first_party() {
+        let acc = make_account(ProviderAccountAuthMode::OAuth, Some("acc-uuid"));
+        let ctx = build_oauth_context(Some(&acc), ProviderKind::FirstParty).unwrap();
+        assert_eq!(ctx.account_uuid.as_deref(), Some("acc-uuid"));
+        assert!(ctx.is_oauth_subscriber);
+    }
+
+    #[test]
+    fn test_build_oauth_context_oauth_3p_not_subscriber() {
+        let acc = make_account(ProviderAccountAuthMode::OAuth, Some("acc-uuid"));
+        let ctx = build_oauth_context(Some(&acc), ProviderKind::Vertex).unwrap();
+        assert_eq!(ctx.account_uuid.as_deref(), Some("acc-uuid"));
+        // Vertex OAuth is not Anthropic-subscriber
+        assert!(!ctx.is_oauth_subscriber);
+    }
+
+    #[test]
+    fn test_build_oauth_context_apikey_returns_none() {
+        let acc = make_account(ProviderAccountAuthMode::ApiKey, Some("acc-uuid"));
+        assert!(build_oauth_context(Some(&acc), ProviderKind::FirstParty).is_none());
+    }
+
+    #[test]
+    fn test_build_oauth_context_no_account_returns_none() {
+        assert!(build_oauth_context(None, ProviderKind::FirstParty).is_none());
     }
 }
