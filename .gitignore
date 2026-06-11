@@ -11,6 +11,7 @@ __pycache__/
 *.db-*
 .DS_Store
 /.vix/
+/.codex-artifacts/
 /*.png
 /*.html
 
