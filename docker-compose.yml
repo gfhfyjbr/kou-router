@@ -1,0 +1,18 @@
+services:
+  kou-router:
+    build: .
+    ports:
+      - "20128:20128"
+      # codex oauth: browser is redirected to localhost:1455 during authorization
+      - "127.0.0.1:1455:1455"
+    environment:
+      # web UI admin password (replaces the interactive first-run prompt)
+      KOU_ROUTER_ADMIN_PASSWORD: ${KOU_ROUTER_ADMIN_PASSWORD:?set KOU_ROUTER_ADMIN_PASSWORD}
+      # the container loopback is unreachable through the published port
+      KOU_OAUTH_CALLBACK_BIND: 0.0.0.0:1455
+    volumes:
+      - kou-data:/data
+    restart: unless-stopped
+
+volumes:
+  kou-data:

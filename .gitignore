@@ -6,8 +6,18 @@ __pycache__/
 
 # Local databases / runtime data
 /.data
+/data/
+*.db
+*.db-*
+.DS_Store
+/.vix/
+/*.png
+/*.html
 
 # Vendored reference repos (kept locally only)
 /OmniRoute-upstream
 /claude-code-sourcemap
 /codex
+
+# Downloaded upstream binaries
+/claude

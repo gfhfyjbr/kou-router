@@ -6,11 +6,11 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Combo, ComboStrategy, EndpointKind, ModelAlias, NewCombo, NewOAuthSession,
-        NewProviderAccount, NewProviderConnection, NewRequestDebugLog, NewResponseDebugLog,
-        OAuthSession, OpenAiModel, ProviderAccount, ProviderAccountAuthMode,
+        NewProviderAccount, NewProviderConnection, NewRequestDebugLog, NewRequestLog,
+        NewResponseDebugLog, OAuthSession, OpenAiModel, ProviderAccount, ProviderAccountAuthMode,
         ProviderAccountRoutingConfig, ProviderAccountRoutingStrategy, ProviderConnection,
-        RequestDebugLog, ResponseDebugLog, SettingsPayload, default_supported_endpoints,
-        supports_endpoint,
+        RequestDebugLog, RequestLog, ResponseDebugLog, SettingsPayload,
+        default_supported_endpoints, supports_endpoint,
     },
     proxy,
 };
@@ -107,6 +107,190 @@ impl SqliteRepository {
             obfuscation_count: input.obfuscation_count,
             created_at: now,
         })
+    }
+
+    pub async fn insert_request_log(&self, input: NewRequestLog) -> AppResult<()> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO request_logs (
+                id, endpoint, requested_model, resolved_model, provider_id, provider_account_id,
+                account_label, api_key_name, status, error, attempts, is_stream, input_tokens,
+                output_tokens, cache_read_tokens, cost_usd, duration_ms, client_body, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&input.id)
+        .bind(&input.endpoint)
+        .bind(&input.requested_model)
+        .bind(&input.resolved_model)
+        .bind(&input.provider_id)
+        .bind(&input.provider_account_id)
+        .bind(&input.account_label)
+        .bind(&input.api_key_name)
+        .bind(input.status)
+        .bind(&input.error)
+        .bind(input.attempts)
+        .bind(input.is_stream as i64)
+        .bind(input.input_tokens)
+        .bind(input.output_tokens)
+        .bind(input.cache_read_tokens)
+        .bind(input.cost_usd)
+        .bind(input.duration_ms)
+        .bind(&input.client_body)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fill in token usage and final duration once a streamed response finishes.
+    pub async fn finalize_stream_request_log(
+        &self,
+        id: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        cache_read_tokens: Option<i64>,
+        cost_usd: Option<f64>,
+        duration_ms: i64,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE request_logs
+            SET input_tokens = COALESCE(?, input_tokens),
+                output_tokens = COALESCE(?, output_tokens),
+                cache_read_tokens = COALESCE(?, cache_read_tokens),
+                cost_usd = COALESCE(?, cost_usd),
+                duration_ms = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cost_usd)
+        .bind(duration_ms)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_request_logs(&self, limit: i64) -> AppResult<Vec<RequestLog>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, endpoint, requested_model, resolved_model, provider_id, provider_account_id,
+                   account_label, api_key_name, status, error, attempts, is_stream, input_tokens,
+                   output_tokens, cache_read_tokens, cost_usd, duration_ms, NULL AS client_body,
+                   created_at
+            FROM request_logs
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_request_log).collect()
+    }
+
+    pub async fn get_request_log(&self, id: &str) -> AppResult<Option<RequestLog>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, endpoint, requested_model, resolved_model, provider_id, provider_account_id,
+                   account_label, api_key_name, status, error, attempts, is_stream, input_tokens,
+                   output_tokens, cache_read_tokens, cost_usd, duration_ms, client_body, created_at
+            FROM request_logs
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(map_request_log).transpose()
+    }
+
+    pub async fn list_request_debug_logs_for_request(
+        &self,
+        request_id: &str,
+    ) -> AppResult<Vec<RequestDebugLog>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, request_id, provider_id, provider_account_id, model, endpoint, sequence_no,
+                   raw_body, created_at
+            FROM request_debug_logs
+            WHERE request_id = ?
+            ORDER BY sequence_no ASC, created_at ASC
+            "#,
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RequestDebugLog {
+                    id: row.try_get("id")?,
+                    request_id: row.try_get("request_id")?,
+                    provider_id: row.try_get("provider_id")?,
+                    provider_account_id: row.try_get("provider_account_id")?,
+                    model: row.try_get("model")?,
+                    endpoint: row.try_get("endpoint")?,
+                    sequence_no: row.try_get("sequence_no")?,
+                    raw_body: row.try_get("raw_body")?,
+                    created_at: parse_dt(row.try_get("created_at")?)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_response_debug_logs_for_request(
+        &self,
+        request_id: &str,
+    ) -> AppResult<Vec<ResponseDebugLog>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, request_id, provider_id, provider_account_id, model, endpoint, sequence_no,
+                   upstream_status, raw_body, reasoning_summary_json, obfuscation_count, created_at
+            FROM response_debug_logs
+            WHERE request_id = ?
+            ORDER BY sequence_no ASC, created_at ASC
+            "#,
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ResponseDebugLog {
+                    id: row.try_get("id")?,
+                    request_id: row.try_get("request_id")?,
+                    provider_id: row.try_get("provider_id")?,
+                    provider_account_id: row.try_get("provider_account_id")?,
+                    model: row.try_get("model")?,
+                    endpoint: row.try_get("endpoint")?,
+                    sequence_no: row.try_get("sequence_no")?,
+                    upstream_status: row.try_get("upstream_status")?,
+                    raw_body: row.try_get("raw_body")?,
+                    reasoning_summary_json: row.try_get("reasoning_summary_json")?,
+                    obfuscation_count: row.try_get("obfuscation_count")?,
+                    created_at: parse_dt(row.try_get("created_at")?)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Wipe the request history: summary rows and the raw per-attempt bodies.
+    pub async fn clear_request_logs(&self) -> AppResult<u64> {
+        let result = sqlx::query("DELETE FROM request_logs")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM request_debug_logs")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM response_debug_logs")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn list_provider_connections(&self) -> AppResult<Vec<ProviderConnection>> {
@@ -335,7 +519,7 @@ impl SqliteRepository {
         let rows = sqlx::query(
             r#"
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
-                   expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
+                   expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
                    last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
@@ -358,7 +542,7 @@ impl SqliteRepository {
         let rows = sqlx::query(
             r#"
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
-                   expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
+                   expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
                    last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
@@ -385,7 +569,7 @@ impl SqliteRepository {
         let row = sqlx::query(
             r#"
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
-                   expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
+                   expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
                    last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
             FROM provider_accounts
@@ -450,10 +634,10 @@ impl SqliteRepository {
             r#"
             INSERT INTO provider_accounts (
                 id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
-                expires_at, scopes_json, remote_account_id, remote_email, enabled, priority,
+                expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                 last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
                 last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -467,6 +651,7 @@ impl SqliteRepository {
         .bind(serde_json::to_string(&scopes)?)
         .bind(&input.remote_account_id)
         .bind(&input.remote_email)
+        .bind(if input.is_fedramp { 1_i64 } else { 0_i64 })
         .bind(if input.enabled { 1_i64 } else { 0_i64 })
         .bind(priority)
         .bind(&proxy_url)
@@ -487,6 +672,7 @@ impl SqliteRepository {
             scopes,
             remote_account_id: input.remote_account_id,
             remote_email: input.remote_email,
+            is_fedramp: input.is_fedramp,
             enabled: input.enabled,
             priority,
             last_used_at: None,
@@ -546,6 +732,8 @@ impl SqliteRepository {
         scopes: &[String],
         remote_account_id: Option<&str>,
         remote_email: Option<&str>,
+        is_fedramp: bool,
+        api_key: Option<&str>,
     ) -> AppResult<bool> {
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query(
@@ -553,6 +741,7 @@ impl SqliteRepository {
             UPDATE provider_accounts
             SET access_token = ?, refresh_token = COALESCE(?, refresh_token), expires_at = ?,
                 scopes_json = ?, remote_account_id = ?, remote_email = ?,
+                is_fedramp = ?, api_key = COALESCE(?, api_key),
                 last_refresh_at = ?, refresh_error = NULL, updated_at = ?
             WHERE id = ?
             "#,
@@ -563,6 +752,8 @@ impl SqliteRepository {
         .bind(serde_json::to_string(scopes)?)
         .bind(remote_account_id)
         .bind(remote_email)
+        .bind(if is_fedramp { 1_i64 } else { 0_i64 })
+        .bind(api_key)
         .bind(&now)
         .bind(&now)
         .bind(account_id)
@@ -1304,6 +1495,7 @@ fn map_provider_account(row: sqlx::sqlite::SqliteRow) -> AppResult<ProviderAccou
         scopes,
         remote_account_id: row.try_get("remote_account_id")?,
         remote_email: row.try_get("remote_email")?,
+        is_fedramp: row.try_get::<i64, _>("is_fedramp")? != 0,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         priority: row.try_get("priority")?,
         last_used_at: parse_optional_dt(row.try_get("last_used_at")?)?,
@@ -1370,6 +1562,30 @@ fn normalize_proxy_url(proxy_url: Option<&str>) -> AppResult<Option<String>> {
         }
         None => Ok(None),
     }
+}
+
+fn map_request_log(row: sqlx::sqlite::SqliteRow) -> AppResult<RequestLog> {
+    Ok(RequestLog {
+        id: row.try_get("id")?,
+        endpoint: row.try_get("endpoint")?,
+        requested_model: row.try_get("requested_model")?,
+        resolved_model: row.try_get("resolved_model")?,
+        provider_id: row.try_get("provider_id")?,
+        provider_account_id: row.try_get("provider_account_id")?,
+        account_label: row.try_get("account_label")?,
+        api_key_name: row.try_get("api_key_name")?,
+        status: row.try_get("status")?,
+        error: row.try_get("error")?,
+        attempts: row.try_get("attempts")?,
+        is_stream: row.try_get::<i64, _>("is_stream")? != 0,
+        input_tokens: row.try_get("input_tokens")?,
+        output_tokens: row.try_get("output_tokens")?,
+        cache_read_tokens: row.try_get("cache_read_tokens")?,
+        cost_usd: row.try_get("cost_usd")?,
+        duration_ms: row.try_get("duration_ms")?,
+        client_body: row.try_get("client_body")?,
+        created_at: parse_dt(row.try_get("created_at")?)?,
+    })
 }
 
 fn parse_dt(value: String) -> AppResult<DateTime<Utc>> {
@@ -1562,6 +1778,7 @@ mod tests {
                 scopes: None,
                 remote_account_id: None,
                 remote_email: None,
+                is_fedramp: false,
                 enabled: true,
                 priority: Some(0),
                 proxy_url: Some("socks5h://1.2.3.4:1080".to_owned()),

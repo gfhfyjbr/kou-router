@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::{Client, Url};
 use serde::Deserialize;
 
@@ -10,20 +12,49 @@ use super::{
     OAuthPkce, OAuthTokenGrant, expires_at_from_now, parse_scope_string, summarize_oauth_error,
 };
 
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
+const ROLES_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/roles";
 
-/// Token endpoint, with `KOU_CC_CLAUDE_TOKEN_URL` env override for tests.
+/// OAuth endpoints, with env overrides for tests.
+fn authorize_url() -> String {
+    std::env::var("KOU_CC_CLAUDE_AUTHORIZE_URL").unwrap_or_else(|_| AUTHORIZE_URL.to_string())
+}
+
 fn token_url() -> String {
     std::env::var("KOU_CC_CLAUDE_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
 }
+
+fn profile_url() -> String {
+    std::env::var("KOU_CC_CLAUDE_PROFILE_URL").unwrap_or_else(|_| PROFILE_URL.to_string())
+}
+
+fn api_key_url() -> String {
+    std::env::var("KOU_CC_CLAUDE_API_KEY_URL").unwrap_or_else(|_| API_KEY_URL.to_string())
+}
+
+fn roles_url() -> String {
+    std::env::var("KOU_CC_CLAUDE_ROLES_URL").unwrap_or_else(|_| ROLES_URL.to_string())
+}
+
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const INFERENCE_SCOPE: &str = "user:inference";
 const DEFAULT_SCOPES: &[&str] = &[
-    "user:file_upload",
-    "user:inference",
-    "user:mcp_servers",
+    "org:create_api_key",
     "user:profile",
+    "user:inference",
     "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+const REFRESH_SCOPES: &[&str] = &[
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
 ];
 
 pub(super) fn default_scopes() -> Vec<String> {
@@ -41,9 +72,10 @@ pub(super) fn build_authorization_url(
     } else {
         scopes.join(" ")
     };
-    let mut url = Url::parse(AUTHORIZE_URL)
+    let mut url = Url::parse(&authorize_url())
         .map_err(|_| AppError::Upstream("invalid claude oauth authorize url".into()))?;
     url.query_pairs_mut()
+        .append_pair("code", "true")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", redirect_uri)
@@ -63,9 +95,9 @@ pub(super) async fn exchange_authorization_code(
     let response = client
         .post(token_url())
         .json(&serde_json::json!({
+            "grant_type": "authorization_code",
             "code": code,
             "state": session.state,
-            "grant_type": "authorization_code",
             "client_id": CLIENT_ID,
             "redirect_uri": session.redirect_uri,
             "code_verifier": session.code_verifier,
@@ -73,7 +105,16 @@ pub(super) async fn exchange_authorization_code(
         .send()
         .await?;
 
-    parse_token_response(response).await
+    let mut grant = parse_token_response(response).await?;
+    if grant.scopes.is_none() {
+        grant.scopes = Some(session.scopes.clone());
+    }
+    enrich_with_profile(client, &mut grant).await?;
+    let _ = fetch_user_roles(client, &grant.access_token).await;
+    if !has_inference_scope(grant.scopes.as_deref()) {
+        grant.api_key = Some(create_api_key(client, &grant.access_token).await?);
+    }
+    Ok(grant)
 }
 
 pub(super) async fn refresh_access_token(
@@ -86,11 +127,93 @@ pub(super) async fn refresh_access_token(
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": CLIENT_ID,
+            "scope": refresh_scope(),
         }))
         .send()
         .await?;
 
     parse_token_response(response).await
+}
+
+fn refresh_scope() -> String {
+    REFRESH_SCOPES.join(" ")
+}
+
+fn has_inference_scope(scopes: Option<&[String]>) -> bool {
+    scopes
+        .map(|scopes| scopes.iter().any(|scope| scope == INFERENCE_SCOPE))
+        .unwrap_or(false)
+}
+
+async fn enrich_with_profile(client: &Client, grant: &mut OAuthTokenGrant) -> AppResult<()> {
+    let profile = fetch_profile(client, &grant.access_token).await?;
+    if let Some(account) = profile.account {
+        if grant.remote_account_id.is_none() {
+            grant.remote_account_id = account.uuid;
+        }
+        if grant.remote_email.is_none() {
+            grant.remote_email = account.email.or(account.email_address);
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_profile(client: &Client, access_token: &str) -> AppResult<ClaudeProfileResponse> {
+    let response = client
+        .get(profile_url())
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "claude oauth profile request failed: {}",
+            summarize_oauth_error(status, &body)
+        )));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn fetch_user_roles(client: &Client, access_token: &str) -> AppResult<()> {
+    let response = client
+        .get(roles_url())
+        .bearer_auth(access_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "claude oauth roles request failed: {}",
+            summarize_oauth_error(status, &body)
+        )));
+    }
+    Ok(())
+}
+
+async fn create_api_key(client: &Client, access_token: &str) -> AppResult<String> {
+    let response = client
+        .post(api_key_url())
+        .bearer_auth(access_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "claude oauth api key request failed: {}",
+            summarize_oauth_error(status, &body)
+        )));
+    }
+    let created: ClaudeApiKeyResponse = serde_json::from_str(&body)?;
+    created.raw_key.ok_or_else(|| {
+        AppError::Upstream("claude oauth api key response did not include raw_key".into())
+    })
 }
 
 async fn parse_token_response(response: reqwest::Response) -> AppResult<OAuthTokenGrant> {
@@ -126,6 +249,8 @@ async fn parse_token_response(response: reqwest::Response) -> AppResult<OAuthTok
             .or(token.scopes),
         remote_account_id: account_uuid,
         remote_email: account_email,
+        is_fedramp: false,
+        api_key: None,
     })
 }
 
@@ -163,6 +288,28 @@ struct ClaudeOrgClaims {
     uuid: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaudeProfileResponse {
+    #[serde(default)]
+    account: Option<ClaudeProfileAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeProfileAccount {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeApiKeyResponse {
+    #[serde(default)]
+    raw_key: Option<String>,
+}
+
 /// Fallback: попытаться декодировать access_token как JWT и достать `sub` claim.
 /// Anthropic OAuth tokens — JWT с `sub` = account uuid.
 fn extract_jwt_sub(jwt: &str) -> Option<String> {
@@ -191,6 +338,56 @@ mod tests {
     }
 
     #[test]
+    fn test_default_scopes_match_claude_cli_order() {
+        assert_eq!(
+            default_scopes(),
+            vec![
+                "org:create_api_key",
+                "user:profile",
+                "user:inference",
+                "user:sessions:claude_code",
+                "user:mcp_servers",
+                "user:file_upload",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_authorization_url_matches_claude_cli() {
+        let pkce = OAuthPkce {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+        let url = build_authorization_url(
+            "https://platform.claude.com/oauth/code/callback",
+            "state",
+            &pkce,
+            &default_scopes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=challenge&code_challenge_method=S256&state=state"
+        );
+    }
+
+    #[test]
+    fn test_refresh_scope_matches_claude_cli_default() {
+        assert_eq!(
+            refresh_scope(),
+            "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+        );
+    }
+
+    #[test]
+    fn test_has_inference_scope_controls_api_key_path() {
+        assert!(has_inference_scope(Some(&["user:inference".to_string()])));
+        assert!(!has_inference_scope(Some(&["user:profile".to_string()])));
+        assert!(!has_inference_scope(None));
+    }
+
+    #[test]
     fn test_parse_token_response_extracts_account_uuid() {
         let body = json!({
             "access_token": "sk-ant-xxx",
@@ -209,7 +406,11 @@ mod tests {
             "acc-uuid-from-response"
         );
         assert_eq!(
-            token.account.as_ref().and_then(|a| a.email_address.clone()).unwrap(),
+            token
+                .account
+                .as_ref()
+                .and_then(|a| a.email_address.clone())
+                .unwrap(),
             "user@example.com"
         );
     }

@@ -448,7 +448,13 @@ async fn provider_presets_can_be_listed_and_imported() {
     assert_eq!(payload["endpoint_paths"]["messages"], "/messages");
     assert_eq!(payload["model_prefix"], "anthro");
     assert_eq!(payload["default_model"], "anthropic/claude-sonnet-4.6");
-    assert_eq!(payload["supported_endpoints"][0], "messages");
+    assert!(
+        payload["supported_endpoints"]
+            .as_array()
+            .is_some_and(|endpoints| endpoints.iter().any(|e| e == "messages")),
+        "anthropic preset must support messages, got {:?}",
+        payload["supported_endpoints"]
+    );
     assert_eq!(payload["rate_limit_protection"], true);
 
     let providers = app

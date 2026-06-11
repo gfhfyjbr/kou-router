@@ -10,10 +10,11 @@ use crate::{
     fingerprint::{ClaudeCodeFingerprint, OAuthContext, ProviderKind},
     models::{
         ComboStrategy, EndpointKind, NewRequestDebugLog, NewResponseDebugLog, NormalizedRequest,
-        OpenAiModelsResponse, ProviderAccount, ProviderAccountAuthMode,
-        ProviderAccountRoutingStrategy, ProviderChatAttempt, RoutingDebug, RoutingProviderAccount,
-        SettingsPayload, supports_endpoint,
+        OpenAiModel, OpenAiModelsResponse, ProviderAccount, ProviderAccountAuthMode,
+        ProviderAccountRoutingStrategy, ProviderChatAttempt, ProviderConnection, RoutingDebug,
+        RoutingProviderAccount, SettingsPayload, supports_endpoint,
     },
+    native_models,
     oauth::OAuthService,
     proxy::ProxyClientCache,
     ratelimit::{RateLimitTracker, parse_rate_limit_headers},
@@ -147,6 +148,9 @@ pub struct RouterService {
     stream_idle_timeout: std::time::Duration,
     pub rate_limit_tracker: RateLimitTracker,
     fingerprint: ClaudeCodeFingerprint,
+    clients: ProxyClientCache,
+    /// provider_connection_id → (годен до, живой список с системного роута)
+    native_models: Arc<Mutex<HashMap<String, (std::time::Instant, Vec<OpenAiModel>)>>>,
 }
 
 pub struct RoutedResponse {
@@ -192,21 +196,96 @@ impl RouterService {
         Self {
             oauth: OAuthService::with_clients(repository.clone(), clients.clone()),
             repository,
-            upstream: UpstreamClient::with_clients(clients),
+            upstream: UpstreamClient::with_clients(clients.clone()),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             translator: Arc::new(TranslatorRegistry::new()),
             retry_config: RetryConfig::from_env(),
             stream_idle_timeout: std::time::Duration::from_secs(stream_idle_timeout_secs),
             rate_limit_tracker: RateLimitTracker::new(),
             fingerprint: ClaudeCodeFingerprint::new(),
+            clients,
+            native_models: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn list_models(&self) -> AppResult<OpenAiModelsResponse> {
+        let mut data = self.repository.get_openai_models_catalog().await?;
+        data.extend(self.native_models_catalog().await);
+        data.sort_by(|a, b| a.id.cmp(&b.id));
+        data.dedup_by(|a, b| a.id == b.id);
         Ok(OpenAiModelsResponse {
             object: "list".to_string(),
-            data: self.repository.get_openai_models_catalog().await?,
+            data,
         })
+    }
+
+    /// Живые модели с системных роутов codex/claude, с кешем по провайдеру:
+    /// успех живёт 5 минут, ошибка — минуту (UI поллит /v1/models каждые 30с).
+    async fn native_models_catalog(&self) -> Vec<OpenAiModel> {
+        let Ok(providers) = self.repository.list_provider_connections().await else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for provider in providers
+            .into_iter()
+            .filter(|p| p.enabled && native_models::supports(&p.provider))
+        {
+            {
+                let cache = self.native_models.lock().await;
+                if let Some((expires, models)) = cache.get(&provider.id)
+                    && *expires > std::time::Instant::now()
+                {
+                    out.extend(models.iter().cloned());
+                    continue;
+                }
+            }
+            let (ttl, models) = match self.fetch_native_models(&provider).await {
+                Ok(models) => (std::time::Duration::from_secs(300), models),
+                Err(err) => {
+                    tracing::debug!(provider = %provider.id, %err, "native models fetch failed");
+                    (std::time::Duration::from_secs(60), Vec::new())
+                }
+            };
+            self.native_models.lock().await.insert(
+                provider.id.clone(),
+                (std::time::Instant::now() + ttl, models.clone()),
+            );
+            out.extend(models);
+        }
+        out
+    }
+
+    async fn fetch_native_models(
+        &self,
+        provider: &ProviderConnection,
+    ) -> AppResult<Vec<OpenAiModel>> {
+        let accounts = self.repository.list_provider_accounts(&provider.id).await?;
+        let account = accounts
+            .iter()
+            .filter(|account| {
+                account.enabled && account.auth_mode == ProviderAccountAuthMode::OAuth
+            })
+            .find(|account| account.access_token.is_some())
+            .ok_or_else(|| {
+                AppError::BadRequest("no enabled oauth account with an access token".into())
+            })?;
+        let token = account.access_token.clone().unwrap_or_default();
+        let client = self.clients.for_optional(account.proxy_url.as_deref())?;
+        let slugs = native_models::fetch(&client, provider, &token).await?;
+
+        let timestamp = Utc::now().timestamp();
+        Ok(slugs
+            .into_iter()
+            .map(|slug| OpenAiModel {
+                id: format!("{}/{}", provider.model_prefix, slug),
+                object: "model".to_string(),
+                owned_by: provider.provider.clone(),
+                created: Some(timestamp),
+                kind: None,
+                dimensions: None,
+                supported_sizes: None,
+            })
+            .collect())
     }
 
     pub async fn list_models_for_endpoint(
@@ -262,7 +341,7 @@ impl RouterService {
                         .circuit_open_until
                         .map(|until| until < now)
                         .unwrap_or(true)
-                    && supports_endpoint(&provider.supported_endpoints, endpoint)
+                    && provider_supports_routed_endpoint(provider, endpoint)
             })
             .collect();
         if providers.is_empty() {
@@ -321,6 +400,7 @@ impl RouterService {
             for provider in matching {
                 let source_format = ProtocolFormat::detect_source(endpoint, &normalized.body);
                 let target_format = ProtocolFormat::from_provider(&provider);
+                let upstream_endpoint = upstream_endpoint_for_provider(endpoint, target_format);
                 let translated_body = if source_format != target_format {
                     self.translator.translate_request(
                         source_format,
@@ -334,7 +414,7 @@ impl RouterService {
                 };
                 let mut provider_body = translated_body.clone();
                 maybe_adapt_codex_responses_request(
-                    endpoint,
+                    upstream_endpoint,
                     &provider,
                     &mut provider_body,
                     &normalized.body,
@@ -354,13 +434,17 @@ impl RouterService {
                         .needs_injection(&target_format, &passthrough_headers)
                     {
                         let mut body = provider_body.clone();
-                        self.fingerprint
-                            .inject_body(&mut body, &normalized.body, oauth_ctx.as_ref());
-                        let mut pt = passthrough_headers.clone().unwrap_or_default();
-                        pt.merge(
-                            self.fingerprint
-                                .generate_headers(&raw_model, provider_kind, oauth_ctx.as_ref()),
+                        self.fingerprint.inject_body(
+                            &mut body,
+                            &normalized.body,
+                            oauth_ctx.as_ref(),
                         );
+                        let mut pt = passthrough_headers.clone().unwrap_or_default();
+                        pt.merge(self.fingerprint.generate_headers(
+                            &raw_model,
+                            provider_kind,
+                            oauth_ctx.as_ref(),
+                        ));
                         (body, Some(pt))
                     } else {
                         (provider_body.clone(), passthrough_headers.clone())
@@ -368,7 +452,7 @@ impl RouterService {
 
                     let prepared_request = prepare_upstream_request(
                         &resolved_provider,
-                        endpoint,
+                        upstream_endpoint,
                         suffix.as_deref(),
                         &raw_model,
                         &final_body,
@@ -396,7 +480,7 @@ impl RouterService {
                             &provider,
                             &resolved_provider,
                             selected_account.as_ref(),
-                            endpoint,
+                            upstream_endpoint,
                             &raw_model,
                             &prepared_request,
                             final_pt.as_ref(),
@@ -440,7 +524,7 @@ impl RouterService {
 
                     match result {
                         UpstreamResult::Streaming(streaming) => {
-                            if endpoint == EndpointKind::Responses
+                            if upstream_endpoint == EndpointKind::Responses
                                 && is_codex_provider(&provider)
                                 && !normalized.stream
                             {
@@ -462,12 +546,15 @@ impl RouterService {
                                     body: transcript.clone(),
                                     account: account_debug.clone(),
                                 };
-                                let (body, routed_is_stream) = adapt_responses_success_body(
-                                    &transcript,
-                                    normalized.stream,
-                                    /*upstream_stream*/ true,
-                                )?;
-                                if let Some(error_message) = responses_stream_error_message(&body) {
+                                let (responses_body, routed_is_stream) =
+                                    adapt_responses_success_body(
+                                        &transcript,
+                                        normalized.stream,
+                                        /*upstream_stream*/ true,
+                                    )?;
+                                if let Some(error_message) =
+                                    responses_stream_error_message(&responses_body)
+                                {
                                     self.repository
                                         .mark_provider_failure(&provider.id, &error_message)
                                         .await?;
@@ -483,12 +570,13 @@ impl RouterService {
                                         axum::http::StatusCode::BAD_GATEWAY,
                                         &error_message,
                                     );
-                                    let upstream_error_body =
-                                        serde_json::to_string(&serde_json::json!({
-                                            "error": body.get("error").cloned().unwrap_or_else(|| {
+                                    let upstream_error_body = serde_json::to_string(
+                                        &serde_json::json!({
+                                            "error": responses_body.get("error").cloned().unwrap_or_else(|| {
                                                 serde_json::json!({"message": error_message})
                                             }),
-                                        }))?;
+                                        }),
+                                    )?;
                                     let enriched_body = crate::error::enriched_error_response(
                                         kind,
                                         axum::http::StatusCode::BAD_GATEWAY,
@@ -505,8 +593,8 @@ impl RouterService {
                                         sequence_no,
                                         streaming.status.as_u16(),
                                         transcript.clone(),
-                                        &body,
-                                        endpoint,
+                                        &responses_body,
+                                        upstream_endpoint,
                                         is_codex_provider(&provider),
                                     );
                                     tried.push(attempt);
@@ -524,10 +612,26 @@ impl RouterService {
                                     sequence_no,
                                     streaming.status.as_u16(),
                                     transcript.clone(),
-                                    &body,
-                                    endpoint,
+                                    &responses_body,
+                                    upstream_endpoint,
                                     is_codex_provider(&provider),
                                 );
+                                let body = if endpoint == EndpointKind::Responses {
+                                    responses_body.clone()
+                                } else {
+                                    let openai_body = self.translator.translate_response(
+                                        ProtocolFormat::OpenAIResponses,
+                                        ProtocolFormat::OpenAI,
+                                        &responses_body,
+                                    )?;
+                                    let openai_body_json = serde_json::to_string(&openai_body)?;
+                                    adapt_success_body(
+                                        endpoint,
+                                        &openai_body_json,
+                                        normalized.stream,
+                                        false,
+                                    )?
+                                };
                                 self.repository.mark_provider_success(&provider.id).await?;
                                 if let Some(account) = selected_account.as_ref() {
                                     self.repository
@@ -576,6 +680,16 @@ impl RouterService {
                             let watched =
                                 watchdog_stream(streaming.stream, self.stream_idle_timeout);
                             let (teed, buffer) = tee_stream_boxerror(watched);
+                            let client_stream = if upstream_endpoint == EndpointKind::Responses
+                                && target_format == ProtocolFormat::OpenAIResponses
+                                && matches!(
+                                    endpoint,
+                                    EndpointKind::ChatCompletions | EndpointKind::Messages
+                                ) {
+                                responses_sse_to_endpoint_stream(teed, endpoint)
+                            } else {
+                                teed
+                            };
                             persist_codex_stream_buffer_debug_log(
                                 self.repository.clone(),
                                 request_id.clone(),
@@ -589,7 +703,7 @@ impl RouterService {
                                 is_codex_provider(&provider),
                             );
                             return Ok(RoutedResult::Stream(RoutedStream {
-                                stream: teed,
+                                stream: client_stream,
                                 debug: RoutingDebug {
                                     request_id: request_id.clone(),
                                     requested_model: normalized.model.clone(),
@@ -633,8 +747,38 @@ impl RouterService {
                                         )
                                     }
                                 } else {
-                                    let body_for_adapt = if target_format != ProtocolFormat::OpenAI
+                                    let body_for_adapt = if target_format
+                                        == ProtocolFormat::OpenAIResponses
                                     {
+                                        if normalized.stream
+                                            && is_sse_transcript(&attempt.body)
+                                            && matches!(
+                                                endpoint,
+                                                EndpointKind::ChatCompletions
+                                                    | EndpointKind::Messages
+                                            )
+                                        {
+                                            routed_is_stream = true;
+                                            responses_sse_transcript_to_endpoint_stream_text(
+                                                &attempt.body,
+                                                endpoint,
+                                            )
+                                        } else {
+                                            let (responses_body, body_is_stream) =
+                                                adapt_responses_success_body(
+                                                    &attempt.body,
+                                                    normalized.stream,
+                                                    is_stream,
+                                                )?;
+                                            routed_is_stream = body_is_stream;
+                                            let translated = self.translator.translate_response(
+                                                ProtocolFormat::OpenAIResponses,
+                                                ProtocolFormat::OpenAI,
+                                                &responses_body,
+                                            )?;
+                                            serde_json::to_string(&translated)?
+                                        }
+                                    } else if target_format != ProtocolFormat::OpenAI {
                                         let parsed: serde_json::Value =
                                             serde_json::from_str(&attempt.body).unwrap_or_else(
                                                 |_| serde_json::json!({"raw": &attempt.body}),
@@ -725,7 +869,7 @@ impl RouterService {
                                     attempt.status,
                                     attempt.body.clone(),
                                     &body,
-                                    endpoint,
+                                    upstream_endpoint,
                                     is_codex_provider(&provider),
                                 );
                                 self.repository.mark_provider_success(&provider.id).await?;
@@ -1266,7 +1410,6 @@ impl RouterService {
         )
         .await
     }
-
 }
 
 fn has_secret(value: Option<&str>) -> bool {
@@ -1274,6 +1417,42 @@ fn has_secret(value: Option<&str>) -> bool {
 }
 fn is_codex_provider(provider: &crate::models::ProviderConnection) -> bool {
     provider.provider.eq_ignore_ascii_case("codex")
+}
+
+fn provider_supports_routed_endpoint(
+    provider: &crate::models::ProviderConnection,
+    endpoint: EndpointKind,
+) -> bool {
+    supports_endpoint(&provider.supported_endpoints, endpoint)
+        || (endpoint_translates_to_claude_messages(endpoint)
+            && ProtocolFormat::from_provider(provider) == ProtocolFormat::Claude
+            && supports_endpoint(&provider.supported_endpoints, EndpointKind::Messages))
+        || (endpoint.is_chat_family()
+            && ProtocolFormat::from_provider(provider) == ProtocolFormat::OpenAIResponses
+            && supports_endpoint(&provider.supported_endpoints, EndpointKind::Responses))
+}
+
+fn upstream_endpoint_for_provider(
+    endpoint: EndpointKind,
+    target_format: ProtocolFormat,
+) -> EndpointKind {
+    if endpoint_translates_to_claude_messages(endpoint) && target_format == ProtocolFormat::Claude {
+        EndpointKind::Messages
+    } else if endpoint.is_chat_family() && target_format == ProtocolFormat::OpenAIResponses {
+        EndpointKind::Responses
+    } else {
+        endpoint
+    }
+}
+
+fn endpoint_translates_to_claude_messages(endpoint: EndpointKind) -> bool {
+    matches!(
+        endpoint,
+        EndpointKind::ChatCompletions
+            | EndpointKind::Completions
+            | EndpointKind::Responses
+            | EndpointKind::Messages
+    )
 }
 
 fn maybe_adapt_codex_responses_request(
@@ -1690,6 +1869,295 @@ fn parse_sse_events(body: &str) -> Vec<(Option<String>, String)> {
     events
 }
 
+#[derive(Default)]
+struct ResponsesStreamState {
+    id: Option<String>,
+    model: Option<String>,
+    messages_started: bool,
+    done: bool,
+}
+
+fn responses_sse_to_endpoint_stream(
+    stream: Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, BoxError>> + Send>>,
+    endpoint: EndpointKind,
+) -> Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, BoxError>> + Send>> {
+    let stream = async_stream::stream! {
+        let mut inner = stream;
+        let mut pending = String::new();
+        let mut state = ResponsesStreamState::default();
+
+        while let Some(chunk) = inner.next().await {
+            let bytes = chunk?;
+            pending.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(index) = pending.find("\n\n") {
+                let event = pending[..index].to_string();
+                pending = pending[index + 2..].to_string();
+                if let Some(translated) =
+                    responses_sse_event_to_endpoint_event(&event, endpoint, &mut state)
+                    && !translated.is_empty()
+                {
+                    yield Ok(Bytes::from(translated));
+                }
+            }
+        }
+
+        if !pending.trim().is_empty()
+            && let Some(translated) =
+                responses_sse_event_to_endpoint_event(&pending, endpoint, &mut state)
+            && !translated.is_empty()
+        {
+            yield Ok(Bytes::from(translated));
+        }
+
+        if !state.done {
+            let done = match endpoint {
+                EndpointKind::Messages => responses_messages_stop_event(&mut state),
+                _ => "data: [DONE]\n\n".to_string(),
+            };
+            yield Ok(Bytes::from(done));
+        }
+    };
+    Box::pin(stream)
+}
+
+fn responses_sse_transcript_to_endpoint_stream_text(body: &str, endpoint: EndpointKind) -> String {
+    let mut state = ResponsesStreamState::default();
+    let mut out = String::new();
+    for (event_name, payload) in parse_sse_events(body) {
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let mut event = String::new();
+        if let Some(event_name) = event_name {
+            event.push_str("event: ");
+            event.push_str(&event_name);
+            event.push('\n');
+        }
+        for line in payload.lines() {
+            event.push_str("data: ");
+            event.push_str(line);
+            event.push('\n');
+        }
+        event.push('\n');
+        if let Some(translated) =
+            responses_sse_event_to_endpoint_event(&event, endpoint, &mut state)
+        {
+            out.push_str(&translated);
+        }
+    }
+    if !state.done {
+        match endpoint {
+            EndpointKind::Messages => out.push_str(&responses_messages_stop_event(&mut state)),
+            _ => out.push_str("data: [DONE]\n\n"),
+        }
+    }
+    out
+}
+
+fn responses_sse_event_to_endpoint_event(
+    event: &str,
+    endpoint: EndpointKind,
+    state: &mut ResponsesStreamState,
+) -> Option<String> {
+    match endpoint {
+        EndpointKind::ChatCompletions => responses_sse_event_to_chat_event(event, state),
+        EndpointKind::Messages => responses_sse_event_to_messages_event(event, state),
+        _ => Some(event.to_string()),
+    }
+}
+
+fn responses_sse_event_to_chat_event(
+    event: &str,
+    state: &mut ResponsesStreamState,
+) -> Option<String> {
+    let (event_name, value) = response_sse_payload(event)?;
+    update_responses_stream_state(&value, state);
+
+    if value.get("error").is_some()
+        || value
+            .pointer("/response/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("failed")
+    {
+        state.done = true;
+        return Some(format!(
+            "data: {}\n\n",
+            response_error_to_openai_error(&value)
+        ));
+    }
+
+    if event_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with("output_text.delta"))
+        && let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str)
+    {
+        return Some(format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": state.id.as_deref().unwrap_or("chatcmpl_kou_router"),
+                "object": "chat.completion.chunk",
+                "model": state.model.clone().unwrap_or_default(),
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": delta},
+                    "finish_reason": null
+                }]
+            })
+        ));
+    }
+
+    if event_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with("completed"))
+    {
+        state.done = true;
+        return Some(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "id": state.id.as_deref().unwrap_or("chatcmpl_kou_router"),
+                "object": "chat.completion.chunk",
+                "model": state.model.clone().unwrap_or_default(),
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            })
+        ));
+    }
+
+    None
+}
+
+fn responses_sse_event_to_messages_event(
+    event: &str,
+    state: &mut ResponsesStreamState,
+) -> Option<String> {
+    let (event_name, value) = response_sse_payload(event)?;
+    update_responses_stream_state(&value, state);
+
+    if value.get("error").is_some()
+        || value
+            .pointer("/response/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("failed")
+    {
+        state.done = true;
+        return Some(format!(
+            "event: error\ndata: {}\n\n",
+            response_error_to_openai_error(&value)
+        ));
+    }
+
+    if event_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with("output_text.delta"))
+        && let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str)
+    {
+        let mut out = String::new();
+        if !state.messages_started {
+            state.messages_started = true;
+            out.push_str(&format!(
+                "event: message_start\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": state.id.as_deref().unwrap_or("msg_kou_router"),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": state.model.clone().unwrap_or_default(),
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                })
+            ));
+            out.push_str("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+        }
+        out.push_str(&format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": delta}
+            })
+        ));
+        return Some(out);
+    }
+
+    if event_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with("completed"))
+    {
+        state.done = true;
+        return Some(responses_messages_stop_event(state));
+    }
+
+    None
+}
+
+fn response_sse_payload(event: &str) -> Option<(Option<String>, serde_json::Value)> {
+    parse_sse_events(event)
+        .into_iter()
+        .filter(|(_, payload)| !payload.is_empty() && payload != "[DONE]")
+        .find_map(|(event_name, payload)| {
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .map(|value| (event_name, value))
+        })
+}
+
+fn update_responses_stream_state(value: &serde_json::Value, state: &mut ResponsesStreamState) {
+    let response = value.get("response").unwrap_or(value);
+    if let Some(id) = response.get("id").and_then(serde_json::Value::as_str) {
+        state.id = Some(id.to_string());
+    }
+    if let Some(model) = response.get("model").and_then(serde_json::Value::as_str) {
+        state.model = Some(model.to_string());
+    }
+}
+
+fn response_error_to_openai_error(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "error": value
+            .get("error")
+            .or_else(|| value.pointer("/response/error"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"message": "responses stream failed"}))
+    })
+}
+
+fn responses_messages_stop_event(state: &mut ResponsesStreamState) -> String {
+    state.done = true;
+    let mut out = String::new();
+    if !state.messages_started {
+        state.messages_started = true;
+        out.push_str(&format!(
+            "event: message_start\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": state.id.as_deref().unwrap_or("msg_kou_router"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": state.model.clone().unwrap_or_default(),
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            })
+        ));
+    }
+    out.push_str(
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+    out.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n");
+    out.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    out
+}
+
 fn merge_response_fields(
     target: &mut serde_json::Map<String, serde_json::Value>,
     value: &serde_json::Value,
@@ -1751,20 +2219,29 @@ fn reconstruct_responses_from_sse(body: &str) -> AppResult<serde_json::Value> {
         }
     }
 
-    if response.get("output").is_none() {
-        let output = if !output_items.is_empty() {
-            serde_json::Value::Array(output_items)
-        } else {
-            serde_json::json!([{
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": synthesized_text,
-                }],
-            }])
-        };
-        response.insert("output".to_string(), output);
+    // codex backend (store=false) шлёт output: [] даже в response.completed —
+    // настоящий контент приходит только в output_item.done / дельтах,
+    // поэтому пустой output из completed-события не считается ответом
+    let output_is_empty = response
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|items| items.is_empty());
+    if output_is_empty {
+        if !output_items.is_empty() {
+            response.insert("output".to_string(), serde_json::Value::Array(output_items));
+        } else if response.get("output").is_none() || !synthesized_text.is_empty() {
+            response.insert(
+                "output".to_string(),
+                serde_json::json!([{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": synthesized_text,
+                    }],
+                }]),
+            );
+        }
     }
     response
         .entry("id".to_string())
@@ -1943,14 +2420,54 @@ fn adapt_to_responses(body: serde_json::Value) -> serde_json::Value {
 
 fn adapt_to_messages(body: serde_json::Value) -> serde_json::Value {
     let text = extract_assistant_text(&body);
-    serde_json::json!({
+    let stop_reason = body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(serde_json::Value::as_str)
+        .map(openai_finish_to_messages_stop_reason)
+        .unwrap_or("end_turn");
+    let mut message = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!("msg_kou_router")),
         "type": "message",
         "role": "assistant",
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "raw_openai_chat": body,
+    });
+    if let Some(usage) = message
+        .get("raw_openai_chat")
+        .and_then(|body| body.get("usage"))
+        .map(openai_usage_to_messages_usage)
+        && let Some(object) = message.as_object_mut()
+    {
+        object.insert("usage".to_string(), usage);
+    }
+    message
+}
+
+fn openai_finish_to_messages_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "length" => "max_tokens",
+        "tool_calls" | "function_call" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn openai_usage_to_messages_usage(usage: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0)),
+        "output_tokens": usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0)),
     })
 }
 
@@ -2573,6 +3090,107 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_responses_provider_supports_chat_family_via_responses() {
+        let provider = crate::models::ProviderConnection {
+            id: "p".into(),
+            provider: "codex".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            api_key: None,
+            auth_type: "oauth".into(),
+            auth_header: "bearer".into(),
+            auth_prefix: Some("Bearer".into()),
+            extra_headers: Default::default(),
+            endpoint_paths: Default::default(),
+            stream_endpoint_paths: Default::default(),
+            model_prefix: "codex".into(),
+            name: None,
+            enabled: true,
+            priority: 0,
+            default_model: Some("codex/gpt-5.5".into()),
+            supported_endpoints: vec!["responses".into()],
+            rate_limit_protection: false,
+            last_error: None,
+            last_error_at: None,
+            last_error_type: None,
+            last_error_source: None,
+            rate_limited_until: None,
+            circuit_open_until: None,
+            last_used_at: None,
+            backoff_level: 0,
+            consecutive_use_count: 0,
+            test_status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            protocol_format: Some("openai-responses".into()),
+        };
+
+        assert!(provider_supports_routed_endpoint(
+            &provider,
+            EndpointKind::ChatCompletions
+        ));
+        assert!(provider_supports_routed_endpoint(
+            &provider,
+            EndpointKind::Messages
+        ));
+        assert_eq!(
+            upstream_endpoint_for_provider(
+                EndpointKind::ChatCompletions,
+                ProtocolFormat::OpenAIResponses
+            ),
+            EndpointKind::Responses
+        );
+    }
+
+    #[test]
+    fn test_claude_provider_supports_chat_family_via_messages() {
+        let provider = crate::models::ProviderConnection {
+            id: "p".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key: Some("sk-test".into()),
+            auth_type: "apikey".into(),
+            auth_header: "x-api-key".into(),
+            auth_prefix: None,
+            extra_headers: Default::default(),
+            endpoint_paths: Default::default(),
+            stream_endpoint_paths: Default::default(),
+            model_prefix: "anthropic".into(),
+            name: None,
+            enabled: true,
+            priority: 0,
+            default_model: Some("anthropic/claude-sonnet-4-20250514".into()),
+            supported_endpoints: vec!["messages".into()],
+            rate_limit_protection: false,
+            last_error: None,
+            last_error_at: None,
+            last_error_type: None,
+            last_error_source: None,
+            rate_limited_until: None,
+            circuit_open_until: None,
+            last_used_at: None,
+            backoff_level: 0,
+            consecutive_use_count: 0,
+            test_status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            protocol_format: Some("claude".into()),
+        };
+
+        assert!(provider_supports_routed_endpoint(
+            &provider,
+            EndpointKind::ChatCompletions
+        ));
+        assert_eq!(
+            upstream_endpoint_for_provider(EndpointKind::ChatCompletions, ProtocolFormat::Claude),
+            EndpointKind::Messages
+        );
+        assert_eq!(
+            upstream_endpoint_for_provider(EndpointKind::Responses, ProtocolFormat::Claude),
+            EndpointKind::Messages
+        );
+    }
+
+    #[test]
     fn test_supports_endpoint_files_capability() {
         assert!(supports_endpoint(
             &["files".to_string()],
@@ -2730,6 +3348,28 @@ mod tests {
     }
 
     #[test]
+    fn test_reconstruct_responses_prefers_items_over_empty_completed_output() {
+        // живой codex backend (store=false): response.completed несёт output: [],
+        // контент есть только в output_item.done
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":13,\"output_tokens\":5,\"total_tokens\":18}}}\n\n"
+        );
+
+        let result = reconstruct_responses_from_sse(body).unwrap();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["output"][0]["content"][0]["text"], "pong");
+        assert_eq!(result["usage"]["total_tokens"], 18);
+    }
+
+    #[test]
     fn test_adapt_responses_success_body_preserves_sse_for_streaming() {
         let body = concat!(
             "event: response.output_text.delta\n",
@@ -2864,7 +3504,11 @@ mod tests {
         let body = json!({
             "id": "chatcmpl-123",
             "model": "gpt-4",
-            "choices": [{"message": {"role": "assistant", "content": "Hello!"}}]
+            "choices": [{
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
         });
         let result = adapt_to_messages(body);
         assert_eq!(result["type"], "message");
@@ -2872,6 +3516,88 @@ mod tests {
         let content = result["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "Hello!");
+        assert_eq!(result["stop_reason"], "max_tokens");
+        assert_eq!(result["usage"]["input_tokens"], 5);
+        assert_eq!(result["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn test_responses_sse_event_to_chat_event() {
+        let mut state = ResponsesStreamState::default();
+        let created = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"
+        );
+        assert_eq!(responses_sse_event_to_chat_event(created, &mut state), None);
+
+        let delta = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"
+        );
+        let translated = responses_sse_event_to_chat_event(delta, &mut state).unwrap();
+        assert!(translated.starts_with("data: "));
+        assert!(translated.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(translated.contains("\"content\":\"pong\""));
+        assert!(translated.contains("\"id\":\"resp_1\""));
+
+        let completed = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let translated = responses_sse_event_to_chat_event(completed, &mut state).unwrap();
+        assert!(translated.contains("\"finish_reason\":\"stop\""));
+        assert!(translated.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_responses_sse_event_to_messages_event() {
+        let mut state = ResponsesStreamState::default();
+        let created = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"
+        );
+        assert_eq!(
+            responses_sse_event_to_messages_event(created, &mut state),
+            None
+        );
+
+        let delta = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n"
+        );
+        let translated = responses_sse_event_to_messages_event(delta, &mut state).unwrap();
+        assert!(translated.contains("event: message_start"));
+        assert!(translated.contains("event: content_block_delta"));
+        assert!(translated.contains("\"text\":\"pong\""));
+
+        let completed = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let translated = responses_sse_event_to_messages_event(completed, &mut state).unwrap();
+        assert!(translated.contains("event: content_block_stop"));
+        assert!(translated.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn test_responses_sse_transcript_to_chat_stream_text() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+
+        let translated =
+            responses_sse_transcript_to_endpoint_stream_text(body, EndpointKind::ChatCompletions);
+
+        assert!(translated.starts_with("data: "));
+        assert!(translated.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(translated.contains("\"content\":\"pong\""));
+        assert!(translated.contains("\"finish_reason\":\"stop\""));
+        assert!(translated.contains("data: [DONE]"));
     }
 
     #[test]
@@ -3053,6 +3779,7 @@ mod tests {
             scopes: vec![],
             remote_account_id: remote_account_id.map(str::to_string),
             remote_email: None,
+            is_fedramp: false,
             enabled: true,
             priority: 0,
             last_used_at: None,

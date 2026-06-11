@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 use crate::{
     audio::AudioService,
     auth::{
-        self, ApiKeyCreated, AuthStatus, CreateApiKeyRequest, LoginRequest, ManagementAuth,
-        SetupRequest,
+        self, ApiKeyCreated, AuthContext, AuthStatus, CreateApiKeyRequest, LoginRequest,
+        ManagementAuth, ProxyIdentity, SetupRequest,
     },
     error::{AppError, AppResult},
     models::{
         CreateAliasRequest, EndpointKind, HealthResponse, NewCombo, NewProviderAccount,
-        NewProviderConnection, OAuthSession, ProviderAccount, ProviderAccountAuthMode,
-        SettingsPayload,
+        NewProviderConnection, NewRequestLog, OAuthSession, ProviderAccount,
+        ProviderAccountAuthMode, RoutingProviderAccount, SettingsPayload,
     },
     oauth::{OAuthCompleteAuthorizationRequest, OAuthService, OAuthStartAuthorizationRequest},
     presets::{ImportProviderPresetRequest, import_request_to_provider, provider_presets},
@@ -256,6 +256,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models/alias", get(list_aliases).post(upsert_alias))
         .route("/api/settings", get(get_settings).post(put_settings))
         .route("/api/ratelimits", get(get_ratelimits))
+        .route(
+            "/api/logs",
+            get(list_request_logs).delete(clear_request_logs),
+        )
+        .route("/api/logs/{id}", get(get_request_log_detail))
         // Auth routes (public)
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/setup", post(auth_setup))
@@ -337,6 +342,7 @@ async fn list_search_models(
 
 async fn chat_completions(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
@@ -347,26 +353,45 @@ async fn chat_completions(
         payload,
         None,
         Some(pt),
+        auth.0,
     )
     .await
 }
 
 async fn completions(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Completions, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::Completions,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn messages(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Messages, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::Messages,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 /// Proxy endpoint for /v1/messages/count_tokens — passes request directly
@@ -463,15 +488,25 @@ async fn files_content(
 
 async fn responses(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Responses, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::Responses,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn responses_with_suffix(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
     Json(payload): Json<Value>,
@@ -483,30 +518,50 @@ async fn responses_with_suffix(
         payload,
         Some(path),
         Some(pt),
+        auth.0,
     )
     .await
 }
 
 async fn ollama_chat(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::OllamaChat, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::OllamaChat,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn embeddings(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Embeddings, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::Embeddings,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn image_generations(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
@@ -517,12 +572,14 @@ async fn image_generations(
         payload,
         None,
         Some(pt),
+        auth.0,
     )
     .await
 }
 
 async fn music_generations(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
@@ -533,12 +590,14 @@ async fn music_generations(
         payload,
         None,
         Some(pt),
+        auth.0,
     )
     .await
 }
 
 async fn video_generations(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
@@ -549,35 +608,47 @@ async fn video_generations(
         payload,
         None,
         Some(pt),
+        auth.0,
     )
     .await
 }
 
 async fn moderations(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Moderations, payload, None, Some(pt)).await
+    route_json(
+        state,
+        EndpointKind::Moderations,
+        payload,
+        None,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn rerank(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Rerank, payload, None, Some(pt)).await
+    route_json(state, EndpointKind::Rerank, payload, None, Some(pt), auth.0).await
 }
 
 async fn search(
     State(state): State<AppState>,
+    auth: ProxyIdentity,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Search, payload, None, Some(pt)).await
+    route_json(state, EndpointKind::Search, payload, None, Some(pt), auth.0).await
 }
 
 async fn audio_speech(
@@ -594,12 +665,108 @@ async fn audio_transcriptions(
     state.audio.transcriptions(&state.service, multipart).await
 }
 
+fn persist_request_log(repository: Arc<SqliteRepository>, log: NewRequestLog) {
+    tokio::spawn(async move {
+        if let Err(err) = repository.insert_request_log(log).await {
+            tracing::warn!(error = %err, "failed to persist request log");
+        }
+    });
+}
+
+/// Insert the summary row for a streaming response, then watch the teed
+/// stream buffer and backfill tokens + true duration once the stream settles.
+fn spawn_stream_request_log(
+    repository: Arc<SqliteRepository>,
+    log: NewRequestLog,
+    model: String,
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+    started: std::time::Instant,
+) {
+    tokio::spawn(async move {
+        let request_id = log.id.clone();
+        if let Err(err) = repository.insert_request_log(log).await {
+            tracing::warn!(error = %err, "failed to persist request log");
+            return;
+        }
+
+        let mut last_len = 0_usize;
+        let mut stable_polls = 0_u8;
+        let mut last_change_ms = 0_i64;
+        for _ in 0..2400 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let len = match buffer.lock() {
+                Ok(buf) => buf.len(),
+                Err(_) => return,
+            };
+            if len == 0 {
+                continue;
+            }
+            if len == last_len {
+                stable_polls += 1;
+                if stable_polls >= 2 {
+                    break;
+                }
+            } else {
+                stable_polls = 0;
+                last_len = len;
+                last_change_ms = started.elapsed().as_millis() as i64;
+            }
+        }
+        if last_len == 0 {
+            return;
+        }
+        let transcript = match buffer.lock() {
+            Ok(buf) => String::from_utf8_lossy(&buf).to_string(),
+            Err(_) => return,
+        };
+        let usage = crate::cost::extract_usage_from_sse(&transcript);
+        let cost_usd = usage
+            .as_ref()
+            .map(|usage| crate::cost::calculate_cost(&model, usage));
+        if let Err(err) = repository
+            .finalize_stream_request_log(
+                &request_id,
+                usage.as_ref().map(|usage| usage.input_tokens as i64),
+                usage.as_ref().map(|usage| usage.output_tokens as i64),
+                usage
+                    .as_ref()
+                    .and_then(|usage| usage.cache_read_tokens)
+                    .map(|tokens| tokens as i64),
+                cost_usd,
+                last_change_ms,
+            )
+            .await
+        {
+            tracing::warn!(error = %err, "failed to finalize stream request log");
+        }
+    });
+}
+
+fn account_display(account: &RoutingProviderAccount) -> String {
+    account
+        .label
+        .clone()
+        .or_else(|| account.remote_email.clone())
+        .unwrap_or_else(|| account.id.clone())
+}
+
+fn error_log_message(err: &AppError) -> String {
+    if let AppError::ClassifiedUpstream { body, .. } = err {
+        if let Some(message) = body.pointer("/error/message").and_then(Value::as_str) {
+            return message.to_string();
+        }
+        return body.to_string();
+    }
+    err.to_string()
+}
+
 async fn route_json(
     state: AppState,
     endpoint: EndpointKind,
     payload: Value,
     suffix: Option<String>,
     passthrough_headers: Option<PassthroughHeaders>,
+    auth: AuthContext,
 ) -> AppResult<Response> {
     // Generate or reuse client-provided request ID
     let request_id = passthrough_headers
@@ -616,7 +783,39 @@ async fn route_json(
         })
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let routed = state
+    let api_key_name = match &auth {
+        AuthContext::ApiKey { key_name, .. } => Some(key_name.clone()),
+        _ => None,
+    };
+    let requested_model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let client_body = serde_json::to_string(&payload).ok();
+    let started = std::time::Instant::now();
+    let new_log = |status: i64, error: Option<String>| NewRequestLog {
+        id: request_id.clone(),
+        endpoint: endpoint.as_str().to_string(),
+        requested_model: requested_model.clone(),
+        resolved_model: requested_model.clone(),
+        provider_id: None,
+        provider_account_id: None,
+        account_label: None,
+        api_key_name: api_key_name.clone(),
+        status,
+        error,
+        attempts: 0,
+        is_stream: false,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cost_usd: None,
+        duration_ms: started.elapsed().as_millis() as i64,
+        client_body: client_body.clone(),
+    };
+
+    let routed = match state
         .service
         .route(
             endpoint,
@@ -625,9 +824,65 @@ async fn route_json(
             passthrough_headers,
             request_id.clone(),
         )
-        .await?;
+        .await
+    {
+        Ok(routed) => routed,
+        Err(err) => {
+            // Classified upstream errors carry the failing provider in the body.
+            let provider_id = match &err {
+                AppError::ClassifiedUpstream { body, .. } => body
+                    .pointer("/error/provider_id")
+                    .or_else(|| body.get("provider_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.starts_with("unresolved:"))
+                    .map(str::to_string),
+                _ => None,
+            };
+            persist_request_log(
+                state.repository.clone(),
+                NewRequestLog {
+                    provider_id,
+                    ..new_log(
+                        i64::from(err.status_code().as_u16()),
+                        Some(error_log_message(&err)),
+                    )
+                },
+            );
+            return Err(err);
+        }
+    };
     match routed {
         RoutedResult::Json(r) => {
+            let last_attempt = r.debug.tried.last();
+            let usage = r.debug.usage.clone();
+            persist_request_log(
+                state.repository.clone(),
+                NewRequestLog {
+                    resolved_model: r.debug.resolved_model.clone(),
+                    provider_id: last_attempt.map(|attempt| attempt.provider_id.clone()),
+                    provider_account_id: last_attempt
+                        .and_then(|attempt| attempt.account.as_ref())
+                        .map(|account| account.id.clone()),
+                    account_label: last_attempt
+                        .and_then(|attempt| attempt.account.as_ref())
+                        .map(account_display),
+                    attempts: r.debug.tried.len() as i64,
+                    is_stream: r.is_stream,
+                    input_tokens: usage.as_ref().map(|usage| usage.input_tokens as i64),
+                    output_tokens: usage.as_ref().map(|usage| usage.output_tokens as i64),
+                    cache_read_tokens: usage
+                        .as_ref()
+                        .and_then(|usage| usage.cache_read_tokens)
+                        .map(|tokens| tokens as i64),
+                    cost_usd: r.debug.cost_usd,
+                    ..new_log(
+                        last_attempt
+                            .map(|attempt| i64::from(attempt.status))
+                            .unwrap_or(200),
+                        None,
+                    )
+                },
+            );
             let mut body = r.body;
             let debug_json = serde_json::to_string(&r.debug).unwrap_or_default();
             let mut builder = Response::builder().header("x-request-id", &request_id);
@@ -664,6 +919,31 @@ async fn route_json(
             }
         }
         RoutedResult::Stream(s) => {
+            let last_attempt = s.debug.tried.last();
+            spawn_stream_request_log(
+                state.repository.clone(),
+                NewRequestLog {
+                    resolved_model: s.debug.resolved_model.clone(),
+                    provider_id: last_attempt.map(|attempt| attempt.provider_id.clone()),
+                    provider_account_id: last_attempt
+                        .and_then(|attempt| attempt.account.as_ref())
+                        .map(|account| account.id.clone()),
+                    account_label: last_attempt
+                        .and_then(|attempt| attempt.account.as_ref())
+                        .map(account_display),
+                    attempts: s.debug.tried.len() as i64,
+                    is_stream: true,
+                    ..new_log(
+                        last_attempt
+                            .map(|attempt| i64::from(attempt.status))
+                            .unwrap_or(200),
+                        None,
+                    )
+                },
+                s.debug.resolved_model.clone(),
+                s.buffer.clone(),
+                started,
+            );
             let body = Body::from_stream(s.stream);
             let mut builder = Response::builder()
                 .header("content-type", "text/event-stream")
@@ -681,6 +961,13 @@ async fn route_json(
             Ok(builder.body(body).unwrap().into_response())
         }
         RoutedResult::Raw(r) => {
+            persist_request_log(
+                state.repository.clone(),
+                NewRequestLog {
+                    attempts: 1,
+                    ..new_log(i64::from(r.status.as_u16()), None)
+                },
+            );
             let mut builder = Response::builder()
                 .status(r.status)
                 .header("x-request-id", &request_id);
@@ -702,12 +989,14 @@ async fn route_json(
 
 async fn list_providers(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
 ) -> AppResult<Json<Vec<crate::models::ProviderConnection>>> {
     Ok(Json(state.repository.list_provider_connections().await?))
 }
 
 async fn create_provider(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
     Json(payload): Json<NewProviderConnection>,
 ) -> AppResult<Json<crate::models::ProviderConnection>> {
     Ok(Json(
@@ -715,12 +1004,15 @@ async fn create_provider(
     ))
 }
 
-async fn list_provider_presets() -> AppResult<Json<Vec<crate::presets::ProviderPreset>>> {
+async fn list_provider_presets(
+    _auth: ManagementAuth,
+) -> AppResult<Json<Vec<crate::presets::ProviderPreset>>> {
     Ok(Json(provider_presets()))
 }
 
 async fn import_provider_preset(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
     Json(payload): Json<ImportProviderPresetRequest>,
 ) -> AppResult<Json<crate::models::ProviderConnection>> {
     let create = import_request_to_provider(payload)?;
@@ -729,12 +1021,16 @@ async fn import_provider_preset(
     ))
 }
 
-async fn list_combos(State(state): State<AppState>) -> AppResult<Json<Vec<crate::models::Combo>>> {
+async fn list_combos(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+) -> AppResult<Json<Vec<crate::models::Combo>>> {
     Ok(Json(state.repository.list_combos().await?))
 }
 
 async fn create_combo(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
     Json(payload): Json<NewCombo>,
 ) -> AppResult<Json<crate::models::Combo>> {
     Ok(Json(state.repository.create_combo(payload).await?))
@@ -742,12 +1038,14 @@ async fn create_combo(
 
 async fn list_aliases(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
 ) -> AppResult<Json<Vec<crate::models::ModelAlias>>> {
     Ok(Json(state.repository.list_aliases().await?))
 }
 
 async fn upsert_alias(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
     Json(payload): Json<CreateAliasRequest>,
 ) -> AppResult<Json<Value>> {
     let alias = state
@@ -757,20 +1055,76 @@ async fn upsert_alias(
     Ok(Json(json!(alias)))
 }
 
-async fn get_settings(State(state): State<AppState>) -> AppResult<Json<Value>> {
+async fn get_settings(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+) -> AppResult<Json<Value>> {
     Ok(Json(state.service.get_settings().await?))
 }
 
-async fn get_ratelimits(State(state): State<AppState>) -> AppResult<Json<Value>> {
+async fn get_ratelimits(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+) -> AppResult<Json<Value>> {
     let states = state.service.rate_limit_tracker.get_all_states();
     Ok(Json(json!({ "ratelimits": states })))
 }
 
 async fn put_settings(
     State(state): State<AppState>,
+    _auth: ManagementAuth,
     Json(payload): Json<SettingsPayload>,
 ) -> AppResult<Json<Value>> {
     Ok(Json(state.service.put_settings(payload).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListRequestLogsQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn list_request_logs(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+    Query(query): Query<ListRequestLogsQuery>,
+) -> AppResult<Json<Value>> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let logs = state.repository.list_request_logs(limit).await?;
+    Ok(Json(json!({ "logs": logs })))
+}
+
+async fn get_request_log_detail(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let log = state
+        .repository
+        .get_request_log(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("request log {id}")))?;
+    let upstream_requests = state
+        .repository
+        .list_request_debug_logs_for_request(&id)
+        .await?;
+    let upstream_responses = state
+        .repository
+        .list_response_debug_logs_for_request(&id)
+        .await?;
+    Ok(Json(json!({
+        "log": log,
+        "upstream_requests": upstream_requests,
+        "upstream_responses": upstream_responses,
+    })))
+}
+
+async fn clear_request_logs(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+) -> AppResult<Json<Value>> {
+    let deleted = state.repository.clear_request_logs().await?;
+    Ok(Json(json!({ "status": "ok", "deleted": deleted })))
 }
 
 async fn list_provider_accounts(
@@ -835,10 +1189,16 @@ async fn start_provider_account_oauth(
         .start_authorization(OAuthStartAuthorizationRequest {
             provider_connection_id: payload.provider_connection_id,
             provider_account_id: payload.provider_account_id,
-            redirect_uri: payload.redirect_uri,
+            redirect_uri: payload.redirect_uri.clone(),
             proxy_url: payload.proxy_url,
         })
         .await?;
+
+    // codex redirects the browser to localhost:1455 (the port Codex CLI
+    // would listen on) — serve that callback ourselves for the session
+    if crate::oauth::callback_server::is_local_callback(&payload.redirect_uri) {
+        crate::oauth::callback_server::spawn(state.oauth.clone()).await;
+    }
 
     Ok(Json(ProviderAccountOAuthStartResponse {
         session: response.session.into(),
@@ -971,43 +1331,12 @@ async fn auth_setup(
     Json(payload): Json<SetupRequest>,
 ) -> AppResult<Json<Value>> {
     // Don't allow re-setup if already configured
-    if state
-        .repository
-        .get_setting_string("admin_password_hash")
-        .await
-        .is_ok()
-    {
+    if auth::bootstrap::is_admin_configured(&state.repository).await {
         return Err(AppError::BadRequest(
             "admin password already configured".into(),
         ));
     }
-    if payload.password.len() < 8 {
-        return Err(AppError::BadRequest(
-            "password must be at least 8 characters".into(),
-        ));
-    }
-    let hash = auth::password::hash_password(&payload.password)?;
-    state
-        .repository
-        .set_setting("admin_password_hash", &format!("\"{hash}\""))
-        .await?;
-
-    // Generate JWT secret if not present
-    if state
-        .repository
-        .get_setting_string("jwt_secret")
-        .await
-        .is_err()
-    {
-        let secret = auth::jwt::generate_jwt_secret();
-        state
-            .repository
-            .set_setting("jwt_secret", &format!("\"{secret}\""))
-            .await?;
-    }
-
-    // Enable auth
-    state.repository.set_setting("require_auth", "true").await?;
+    auth::bootstrap::set_admin_password(&state.repository, &payload.password).await?;
 
     Ok(Json(
         json!({"status": "ok", "message": "Admin password set and auth enabled"}),

@@ -26,6 +26,7 @@ use axum::{
     routing::post,
 };
 use chrono::{Duration as ChronoDuration, Utc};
+use http_body_util::BodyExt;
 use kou_router::{
     SqliteRepository, build_app, init_db,
     models::{
@@ -113,14 +114,10 @@ async fn capture_handler(
                 .map(|v| (n.as_str().to_lowercase(), v.to_string()))
         })
         .collect();
-    state
-        .messages_calls
-        .lock()
-        .unwrap()
-        .push(Captured {
-            headers: header_map,
-            body: body_value,
-        });
+    state.messages_calls.lock().unwrap().push(Captured {
+        headers: header_map,
+        body: body_value,
+    });
     let mut q = state.messages_responses.lock().unwrap();
     let (status, body_json) = if q.len() > 1 {
         q.remove(0)
@@ -214,10 +211,7 @@ async fn create_provider(
             enabled: true,
             priority: Some(0),
             default_model: Some(default_model.to_string()),
-            supported_endpoints: Some(vec![
-                "messages".to_string(),
-                "chat.completions".to_string(),
-            ]),
+            supported_endpoints: Some(vec!["messages".to_string(), "chat.completions".to_string()]),
             rate_limit_protection: false,
             protocol_format: protocol_format.map(str::to_string),
         })
@@ -246,6 +240,7 @@ async fn create_oauth_account(
             scopes: Some(vec!["user:inference".to_string()]),
             remote_account_id: remote_account_id.map(str::to_string),
             remote_email: None,
+            is_fedramp: false,
             enabled: true,
             priority: Some(0),
             proxy_url: None,
@@ -262,6 +257,14 @@ fn messages_request_body(model: &str) -> Value {
     })
 }
 
+fn chat_completions_request_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Hello, world! This is a chat test."}]
+    })
+}
+
 async fn post_messages(
     app: axum::Router,
     body: Value,
@@ -270,6 +273,22 @@ async fn post_messages(
     let mut builder = axum::http::Request::builder()
         .method("POST")
         .uri("/v1/messages")
+        .header("content-type", "application/json");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder.body(Body::from(body.to_string())).unwrap();
+    app.oneshot(req).await.unwrap()
+}
+
+async fn post_chat_completions(
+    app: axum::Router,
+    body: Value,
+    extra_headers: &[(&str, &str)],
+) -> axum::http::Response<Body> {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
         .header("content-type", "application/json");
     for (name, value) in extra_headers {
         builder = builder.header(*name, *value);
@@ -375,27 +394,36 @@ async fn test_non_cc_client_anthropic_apikey_injects_full_fingerprint() {
     for token in [
         "claude-code-20250219",
         "interleaved-thinking-2025-05-14",
-        "redact-thinking-2026-02-12",
         "prompt-caching-scope-2026-01-05",
-        "fast-mode-2026-02-01",
-        "task-budgets-2026-03-13",
-        "advisor-tool-2026-03-01",
-        "context-management-2025-06-27",
-        // context-1m gates on `[1m]` suffix \u2014 plain model without it should NOT have the beta
-        // "context-1m-2025-08-07" intentionally absent from the required list
-        "advanced-tool-use-2025-11-20",
         "effort-2025-11-24",
     ] {
         assert!(beta.contains(token), "missing beta token {token} in {beta}");
     }
+    for token in [
+        "redact-thinking-2026-02-12",
+        "fast-mode-2026-02-01",
+        "task-budgets-2026-03-13",
+        "advisor-tool-2026-03-01",
+        "context-management-2025-06-27",
+        "advanced-tool-use-2025-11-20",
+        "structured-outputs-2025-12-15",
+        "afk-mode-2026-01-31",
+    ] {
+        assert!(
+            !beta.contains(token),
+            "default beta set should not include {token}: {beta}"
+        );
+    }
     assert!(
         !beta.contains("context-1m-2025-08-07"),
-        "context-1m beta must NOT be sent for models without `[1m]` suffix; got: {beta}"
+        "context-1m beta must NOT be sent for pre-4.6 models without `[1m]`; got: {beta}"
     );
 
-    let system = call.body.get("system").and_then(Value::as_array).expect(
-        "system should be array after fingerprint injection",
-    );
+    let system = call
+        .body
+        .get("system")
+        .and_then(Value::as_array)
+        .expect("system should be array after fingerprint injection");
     let first_text = system[0]
         .get("text")
         .and_then(Value::as_str)
@@ -421,6 +449,119 @@ async fn test_non_cc_client_anthropic_apikey_injects_full_fingerprint() {
     assert_eq!(user_id["account_uuid"].as_str(), Some(""));
     let body_session = user_id["session_id"].as_str().expect("session_id");
     Uuid::parse_str(body_session).expect("body session_id is a valid UUID");
+}
+
+/// If the client supplies `anthropic-beta` but does not present itself as
+/// Claude Code, the router still injects the missing Claude Code identity
+/// headers while preserving the client-owned beta string exactly.
+#[tokio::test]
+#[serial]
+async fn test_client_anthropic_beta_is_preserved_when_injecting_fingerprint() {
+    let mock = MockState::default_messages();
+    let upstream = spawn_mock(mock.clone()).await;
+
+    let state = setup_state().await;
+    create_provider(
+        &state,
+        "anthropic",
+        &upstream,
+        Some("sk-test"),
+        "x-api-key",
+        None,
+        "anthropic",
+        "anthropic/claude-sonnet-4-20250514",
+        Some("claude"),
+    )
+    .await;
+    let app = build_app(state);
+
+    let resp = post_messages(
+        app,
+        messages_request_body("anthropic/claude-sonnet-4-20250514"),
+        &[("anthropic-beta", "client-beta-1,client-beta-2")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let calls = mock.captured();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(
+        call.headers.get("anthropic-beta").map(String::as_str),
+        Some("client-beta-1,client-beta-2"),
+        "router must not replace a client-supplied anthropic-beta"
+    );
+    assert_eq!(
+        call.headers.get("x-app").map(String::as_str),
+        Some("cli"),
+        "missing Claude Code identity headers should still be injected"
+    );
+    assert!(
+        call.body
+            .get("system")
+            .and_then(Value::as_array)
+            .is_some_and(|system| system
+                .first()
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))),
+        "body attribution should still be injected"
+    );
+}
+
+/// OpenAI-compatible clients can hit `/v1/chat/completions`; when the selected
+/// upstream speaks Claude, the translated request still receives Claude Code
+/// headers.
+#[tokio::test]
+#[serial]
+async fn test_openai_chat_completions_to_claude_provider_injects_claude_code_headers() {
+    let mock = MockState::default_messages();
+    let upstream = spawn_mock(mock.clone()).await;
+
+    let state = setup_state().await;
+    create_provider(
+        &state,
+        "anthropic",
+        &upstream,
+        Some("sk-test"),
+        "x-api-key",
+        None,
+        "anthropic",
+        "anthropic/claude-sonnet-4-20250514",
+        Some("claude"),
+    )
+    .await;
+    let app = build_app(state);
+
+    let resp = post_chat_completions(
+        app,
+        chat_completions_request_body("anthropic/claude-sonnet-4-20250514"),
+        &[],
+    )
+    .await;
+    let status = resp.status();
+    if status != StatusCode::OK {
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        panic!(
+            "expected OpenAI chat -> Claude request to succeed, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let calls = mock.captured();
+    assert_eq!(calls.len(), 1);
+    let headers = &calls[0].headers;
+    assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
+    assert_eq!(
+        headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+    let beta = headers.get("anthropic-beta").expect("beta header");
+    assert!(beta.contains("claude-code-20250219"), "beta: {beta}");
+    assert!(
+        beta.contains("prompt-caching-scope-2026-01-05"),
+        "beta: {beta}"
+    );
 }
 
 /// Test 2: When the client already presents itself as Claude Code (`x-app` set),
@@ -515,16 +656,14 @@ async fn test_3p_provider_no_first_party_betas() {
 
     let calls = mock.captured();
     assert_eq!(calls.len(), 1);
-    let beta = calls[0]
-        .headers
-        .get("anthropic-beta")
-        .expect("beta header");
+    let beta = calls[0].headers.get("anthropic-beta").expect("beta header");
 
     for forbidden in [
         "prompt-caching-scope",
         "fast-mode",
         "redact-thinking",
         "advanced-tool-use",
+        "context-management-2025-06-27",
         "web-search-2025-03-05",
     ] {
         assert!(
@@ -535,10 +674,6 @@ async fn test_3p_provider_no_first_party_betas() {
     assert!(
         beta.contains("tool-search-tool-2025-10-19"),
         "3P provider should get tool-search-tool beta: {beta}"
-    );
-    assert!(
-        beta.contains("context-management-2025-06-27"),
-        "3P provider with Claude4+ should get context-management: {beta}"
     );
 }
 
@@ -575,10 +710,7 @@ async fn test_vertex_claude4_includes_web_search() {
 
     let calls = mock.captured();
     assert_eq!(calls.len(), 1);
-    let beta = calls[0]
-        .headers
-        .get("anthropic-beta")
-        .expect("beta header");
+    let beta = calls[0].headers.get("anthropic-beta").expect("beta header");
     assert!(
         beta.contains("web-search-2025-03-05"),
         "Vertex + Claude4+ should receive web-search beta: {beta}"
@@ -618,10 +750,7 @@ async fn test_haiku_first_party_no_claude_code_no_interleaved_no_context1m() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let calls = mock.captured();
-    let beta = calls[0]
-        .headers
-        .get("anthropic-beta")
-        .expect("beta header");
+    let beta = calls[0].headers.get("anthropic-beta").expect("beta header");
     for forbidden in [
         "claude-code-20250219",
         "interleaved-thinking-2025-05-14",
@@ -642,11 +771,10 @@ async fn test_haiku_first_party_no_claude_code_no_interleaved_no_context1m() {
     );
 }
 
-/// Test 6: Sonnet 4.5 on 1P picks up the `structured-outputs-2025-12-15`
-/// beta in addition to the standard 1P set.
+/// Test 6: Sonnet 4.5 on 1P uses the conservative default beta set.
 #[tokio::test]
 #[serial]
-async fn test_claude45_sonnet_first_party_includes_structured_outputs() {
+async fn test_claude45_sonnet_first_party_does_not_synthesize_structured_outputs() {
     let mock = MockState::default_messages();
     let upstream = spawn_mock(mock.clone()).await;
 
@@ -674,17 +802,51 @@ async fn test_claude45_sonnet_first_party_includes_structured_outputs() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let calls = mock.captured();
-    let beta = calls[0]
-        .headers
-        .get("anthropic-beta")
-        .expect("beta header");
-    for token in [
-        "structured-outputs-2025-12-15",
-        "claude-code-20250219",
-        "prompt-caching-scope-2026-01-05",
-    ] {
+    let beta = calls[0].headers.get("anthropic-beta").expect("beta header");
+    for token in ["claude-code-20250219", "prompt-caching-scope-2026-01-05"] {
         assert!(beta.contains(token), "missing {token} in {beta}");
     }
+    assert!(
+        !beta.contains("structured-outputs-2025-12-15"),
+        "router should not synthesize structured-outputs by default: {beta}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sonnet46_first_party_includes_context_1m() {
+    let mock = MockState::default_messages();
+    let upstream = spawn_mock(mock.clone()).await;
+
+    let state = setup_state().await;
+    create_provider(
+        &state,
+        "anthropic",
+        &upstream,
+        Some("sk-test"),
+        "x-api-key",
+        None,
+        "anthropic",
+        "anthropic/claude-sonnet-4-6-20250514",
+        Some("claude"),
+    )
+    .await;
+    let app = build_app(state);
+
+    let resp = post_messages(
+        app,
+        messages_request_body("anthropic/claude-sonnet-4-6-20250514"),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let calls = mock.captured();
+    let beta = calls[0].headers.get("anthropic-beta").expect("beta header");
+    assert!(
+        beta.contains("context-1m-2025-08-07"),
+        "Sonnet 4.6+ should receive context-1m beta: {beta}"
+    );
 }
 
 /// Test 7: An Anthropic OAuth account on a 1P provider gets the
@@ -763,7 +925,10 @@ async fn test_oauth_proactive_refresh_when_token_near_expiry() {
     let upstream = spawn_mock(mock.clone()).await;
 
     let mut env = EnvGuard::new();
-    env.set("KOU_CC_CLAUDE_TOKEN_URL", &format!("{upstream}/v1/oauth/token"));
+    env.set(
+        "KOU_CC_CLAUDE_TOKEN_URL",
+        &format!("{upstream}/v1/oauth/token"),
+    );
 
     let state = setup_state().await;
     let provider = create_provider(
@@ -829,7 +994,10 @@ async fn test_oauth_401_triggers_refresh_and_retry() {
     let upstream = spawn_mock(mock.clone()).await;
 
     let mut env = EnvGuard::new();
-    env.set("KOU_CC_CLAUDE_TOKEN_URL", &format!("{upstream}/v1/oauth/token"));
+    env.set(
+        "KOU_CC_CLAUDE_TOKEN_URL",
+        &format!("{upstream}/v1/oauth/token"),
+    );
 
     let state = setup_state().await;
     let provider = create_provider(
@@ -864,7 +1032,11 @@ async fn test_oauth_401_triggers_refresh_and_retry() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let calls = mock.captured();
-    assert_eq!(calls.len(), 2, "messages endpoint called twice (401 + retry)");
+    assert_eq!(
+        calls.len(),
+        2,
+        "messages endpoint called twice (401 + retry)"
+    );
     assert_eq!(
         mock.token_call_count(),
         1,

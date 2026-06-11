@@ -152,6 +152,8 @@ pub struct ProviderAccount {
     pub scopes: Vec<String>,
     pub remote_account_id: Option<String>,
     pub remote_email: Option<String>,
+    #[serde(default)]
+    pub is_fedramp: bool,
     pub enabled: bool,
     pub priority: i64,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -184,6 +186,8 @@ pub struct NewProviderAccount {
     pub scopes: Option<Vec<String>>,
     pub remote_account_id: Option<String>,
     pub remote_email: Option<String>,
+    #[serde(default)]
+    pub is_fedramp: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub priority: Option<i64>,
@@ -379,6 +383,56 @@ pub struct NewResponseDebugLog {
     pub raw_body: String,
     pub reasoning_summary_json: Option<String>,
     pub obfuscation_count: i64,
+}
+
+/// One row of the request log: a client request seen by the router with its
+/// final outcome. Raw per-attempt bodies live in `request_debug_logs` /
+/// `response_debug_logs` keyed by the same request id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLog {
+    pub id: String,
+    pub endpoint: String,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub provider_id: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub api_key_name: Option<String>,
+    pub status: i64,
+    pub error: Option<String>,
+    pub attempts: i64,
+    pub is_stream: bool,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: i64,
+    /// Raw client request body. Only populated by the detail endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_body: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRequestLog {
+    pub id: String,
+    pub endpoint: String,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub provider_id: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub api_key_name: Option<String>,
+    pub status: i64,
+    pub error: Option<String>,
+    pub attempts: i64,
+    pub is_stream: bool,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: i64,
+    pub client_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

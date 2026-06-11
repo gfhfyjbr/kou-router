@@ -26,9 +26,13 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 pub type BoxErrorStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
 pub type TeeBuffer = Arc<Mutex<Vec<u8>>>;
+const CODEX_ORIGINATOR_HEADER: &str = "originator";
+const CODEX_ORIGINATOR_VALUE: &str = "codex_cli_rs";
+const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+const OPENAI_BETA_RESPONSES_VALUE: &str = "responses=experimental";
 
 /// Headers from the incoming request that should be passed through to upstream.
-/// Primarily for Anthropic-specific headers that Claude Code sends.
+/// Covers Claude Code and Codex session/turn headers that clients own.
 #[derive(Debug, Clone, Default)]
 pub struct PassthroughHeaders {
     pub headers: Vec<(String, String)>,
@@ -36,21 +40,39 @@ pub struct PassthroughHeaders {
 
 impl PassthroughHeaders {
     /// Extract passthrough headers from an incoming axum request's HeaderMap.
-    /// Captures: anthropic-beta, anthropic-version, x-client-request-id, and Claude Code specific headers
     pub fn from_header_map(headers: &axum::http::HeaderMap) -> Self {
         const PASSTHROUGH_NAMES: &[&str] = &[
             "anthropic-beta",
             "anthropic-version",
             "x-request-id",
             "x-client-request-id",
-            // Claude Code specific headers
             "x-app",
             "user-agent",
             "x-claude-code-session-id",
+            "x-claude-code-agent-id",
+            "x-claude-code-parent-agent-id",
             "x-claude-remote-container-id",
             "x-claude-remote-session-id",
             "x-client-app",
             "x-anthropic-additional-protection",
+            "anthropic-client-platform",
+            "openai-beta",
+            "originator",
+            "session-id",
+            "thread-id",
+            "traceparent",
+            "tracestate",
+            "x-codex-beta-features",
+            "x-codex-installation-id",
+            "x-codex-parent-thread-id",
+            "x-codex-turn-metadata",
+            "x-codex-turn-state",
+            "x-codex-window-id",
+            "x-oai-attestation",
+            "x-openai-internal-codex-responses-lite",
+            "x-openai-memgen-request",
+            "x-openai-subagent",
+            "x-responsesapi-include-timing-metrics",
         ];
         let mut extracted = Vec::new();
         for &name in PASSTHROUGH_NAMES {
@@ -121,6 +143,29 @@ impl PassthroughHeaders {
         self.set_if_missing("anthropic-version", "2023-06-01");
         self.merge_csv_header("anthropic-beta", "files-api-2025-04-14,oauth-2025-04-20");
     }
+}
+
+fn passthrough_contains(headers: Option<&PassthroughHeaders>, name: &str) -> bool {
+    headers.is_some_and(|passthrough| {
+        passthrough
+            .headers
+            .iter()
+            .any(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn provider_extra_contains(provider: &ProviderConnection, name: &str) -> bool {
+    provider
+        .extra_headers
+        .keys()
+        .any(|header_name| header_name.eq_ignore_ascii_case(name))
+}
+
+fn skip_codex_extra_header(provider: &ProviderConnection, name: &str, value: &str) -> bool {
+    is_codex_responses_provider(provider)
+        && (name.eq_ignore_ascii_case("version")
+            || name.eq_ignore_ascii_case("user-agent")
+                && value.starts_with("codex_cli_rs/0.124.0 "))
 }
 
 /// Result of upstream execution — either buffered or streaming
@@ -241,6 +286,15 @@ pub fn provider_with_account_auth(
                 {
                     resolved.extra_headers.remove("ChatGPT-Account-ID");
                 }
+                // FedRAMP-enrolled workspaces must advertise themselves so the
+                // backend routes them through the FedRAMP edge, matching the
+                // upstream `BearerAuthProvider::add_auth_headers` behavior.
+                if account.is_fedramp {
+                    resolved
+                        .extra_headers
+                        .entry("X-OpenAI-Fedramp".to_string())
+                        .or_insert_with(|| "true".to_string());
+                }
             }
         }
     }
@@ -313,17 +367,25 @@ impl UpstreamClient {
     }
 
     /// Extract response headers that should be forwarded back to the client.
-    /// Captures rate-limit headers, retry-after, and request-id from upstream.
+    /// Captures rate-limit headers, retry-after, request-id, and Codex turn state from upstream.
     fn extract_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
-        const FORWARD_PREFIXES: &[&str] = &["anthropic-ratelimit-", "x-ratelimit-"];
-        const FORWARD_EXACT: &[&str] = &["retry-after", "request-id", "x-request-id"];
+        const FORWARD_PREFIXES: &[&str] = &["anthropic-ratelimit-", "x-ratelimit-", "x-codex-"];
+        const FORWARD_EXACT: &[&str] = &[
+            "retry-after",
+            "request-id",
+            "x-request-id",
+            "openai-model",
+            "x-reasoning-included",
+        ];
         let mut result = Vec::new();
         for (name, value) in headers.iter() {
-            let n = name.as_str();
-            let matched =
-                FORWARD_EXACT.contains(&n) || FORWARD_PREFIXES.iter().any(|p| n.starts_with(p));
-            if matched && let Ok(v) = value.to_str() {
-                result.push((n.to_string(), v.to_string()));
+            let name = name.as_str();
+            let matched = FORWARD_EXACT.contains(&name)
+                || FORWARD_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix));
+            if matched && let Ok(value) = value.to_str() {
+                result.push((name.to_string(), value.to_string()));
             }
         }
         result
@@ -394,8 +456,9 @@ impl UpstreamClient {
                     }
                 }
             };
+            let builder = apply_provider_headers(builder, provider, passthrough_headers);
             let builder = apply_passthrough_headers(builder, passthrough_headers);
-            let response = apply_provider_headers(builder, provider).send().await?;
+            let response = builder.send().await?;
             let status = response.status();
             let resp_headers = Self::extract_response_headers(response.headers());
             let body = response.text().await?;
@@ -429,8 +492,9 @@ impl UpstreamClient {
             let builder = client
                 .request(Method::POST, &prepared.url)
                 .json(request_body);
+            let builder = apply_provider_headers(builder, provider, passthrough_headers);
             let builder = apply_passthrough_headers(builder, passthrough_headers);
-            let response = apply_provider_headers(builder, provider).send().await?;
+            let response = builder.send().await?;
             let status = response.status();
             let is_stream = Self::is_streaming_response(
                 endpoint,
@@ -495,8 +559,9 @@ impl UpstreamClient {
         } else {
             builder
         };
+        let builder = apply_provider_headers(builder, provider, passthrough_headers);
         let builder = apply_passthrough_headers(builder, passthrough_headers);
-        let response = apply_provider_headers(builder, provider).send().await?;
+        let response = builder.send().await?;
         let status = response.status();
         let content_type = response
             .headers()
@@ -522,7 +587,9 @@ impl UpstreamClient {
 
         let client = self.client_for(proxy_url)?;
         let builder = client.request(Method::POST, url).json(&request_body);
-        let response = apply_provider_headers(builder, provider).send().await?;
+        let response = apply_provider_headers(builder, provider, None)
+            .send()
+            .await?;
         let status = response.status();
         let content_type = response
             .headers()
@@ -568,7 +635,9 @@ impl UpstreamClient {
 
         let client = self.client_for(proxy_url)?;
         let builder = client.request(Method::POST, url).multipart(form);
-        let response = apply_provider_headers(builder, provider).send().await?;
+        let response = apply_provider_headers(builder, provider, None)
+            .send()
+            .await?;
         let status = response.status();
         let content_type = response
             .headers()
@@ -666,6 +735,7 @@ fn apply_passthrough_headers(
 fn apply_provider_headers(
     mut builder: RequestBuilder,
     provider: &ProviderConnection,
+    passthrough_headers: Option<&PassthroughHeaders>,
 ) -> RequestBuilder {
     if let Some(api_key) = &provider.api_key {
         let header = provider.auth_header.trim().to_ascii_lowercase();
@@ -700,7 +770,25 @@ fn apply_provider_headers(
         }
     }
 
+    if is_codex_responses_provider(provider) {
+        if !provider_extra_contains(provider, CODEX_ORIGINATOR_HEADER)
+            && !passthrough_contains(passthrough_headers, CODEX_ORIGINATOR_HEADER)
+        {
+            builder = builder.header(CODEX_ORIGINATOR_HEADER, CODEX_ORIGINATOR_VALUE);
+        }
+        if !provider_extra_contains(provider, OPENAI_BETA_HEADER)
+            && !passthrough_contains(passthrough_headers, OPENAI_BETA_HEADER)
+        {
+            builder = builder.header(OPENAI_BETA_HEADER, OPENAI_BETA_RESPONSES_VALUE);
+        }
+    }
+
     for (key, value) in &provider.extra_headers {
+        if passthrough_contains(passthrough_headers, key)
+            || skip_codex_extra_header(provider, key, value)
+        {
+            continue;
+        }
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(key.as_bytes()),
             HeaderValue::from_str(value),

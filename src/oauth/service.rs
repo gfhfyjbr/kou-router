@@ -161,6 +161,8 @@ impl OAuthService {
                     &scopes,
                     token_grant.remote_account_id.as_deref(),
                     token_grant.remote_email.as_deref(),
+                    token_grant.is_fedramp,
+                    token_grant.api_key.as_deref(),
                 )
                 .await?;
             if !updated {
@@ -182,13 +184,14 @@ impl OAuthService {
                         .clone()
                         .or_else(|| token_grant.remote_account_id.clone()),
                     auth_mode: ProviderAccountAuthMode::OAuth,
-                    api_key: None,
+                    api_key: token_grant.api_key.clone(),
                     access_token: Some(token_grant.access_token.clone()),
                     refresh_token: token_grant.refresh_token.clone(),
                     expires_at: token_grant.expires_at,
                     scopes: Some(scopes.clone()),
                     remote_account_id: token_grant.remote_account_id.clone(),
                     remote_email: token_grant.remote_email.clone(),
+                    is_fedramp: token_grant.is_fedramp,
                     enabled: true,
                     priority: None,
                     proxy_url: session.proxy_url.clone(),
@@ -254,6 +257,10 @@ impl OAuthService {
             .remote_email
             .as_deref()
             .or(account.remote_email.as_deref());
+        // Upstream `persist_tokens` only refreshes id_token-derived claims when
+        // the refresh response actually carries an id_token. If it doesn't, the
+        // prior FedRAMP status is preserved (it cannot silently downgrade).
+        let is_fedramp = token_grant.is_fedramp || account.is_fedramp;
 
         let updated = self
             .repository
@@ -265,6 +272,8 @@ impl OAuthService {
                 &scopes,
                 remote_account_id,
                 remote_email,
+                is_fedramp,
+                token_grant.api_key.as_deref(),
             )
             .await?;
         if !updated {

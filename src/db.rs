@@ -196,6 +196,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
             scopes_json TEXT NOT NULL DEFAULT '[]',
             remote_account_id TEXT,
             remote_email TEXT,
+            is_fedramp INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
             priority INTEGER NOT NULL DEFAULT 0,
             last_used_at TEXT,
@@ -231,6 +232,14 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         sqlx::query("ALTER TABLE provider_accounts ADD COLUMN proxy_url TEXT")
             .execute(&pool)
             .await?;
+    }
+
+    if !has_provider_account_column("is_fedramp") {
+        sqlx::query(
+            "ALTER TABLE provider_accounts ADD COLUMN is_fedramp INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&pool)
+        .await?;
     }
 
     sqlx::query(
@@ -383,6 +392,40 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS request_logs (
+            id TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            requested_model TEXT NOT NULL,
+            resolved_model TEXT NOT NULL,
+            provider_id TEXT,
+            provider_account_id TEXT,
+            account_label TEXT,
+            api_key_name TEXT,
+            status INTEGER NOT NULL,
+            error TEXT,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            is_stream INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cost_usd REAL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            client_body TEXT,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS combos (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
@@ -463,7 +506,11 @@ mod tests {
             .into_iter()
             .map(|row| row.try_get::<String, _>("name").unwrap())
             .collect();
-        assert!(request_column_names.iter().any(|name| name == "sequence_no"));
+        assert!(
+            request_column_names
+                .iter()
+                .any(|name| name == "sequence_no")
+        );
         assert!(request_column_names.iter().any(|name| name == "raw_body"));
 
         let response_columns = sqlx::query("PRAGMA table_info(response_debug_logs)")
@@ -474,6 +521,10 @@ mod tests {
             .into_iter()
             .map(|row| row.try_get::<String, _>("name").unwrap())
             .collect();
-        assert!(response_column_names.iter().any(|name| name == "sequence_no"));
+        assert!(
+            response_column_names
+                .iter()
+                .any(|name| name == "sequence_no")
+        );
     }
 }

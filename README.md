@@ -1,407 +1,357 @@
 # kou-router
 
-LLM/AI-роутер на Rust + axum. Принимает запросы в формате OpenAI / Anthropic /
-Gemini / Ollama, переводит их между протоколами и проксирует в любой из
-поддерживаемых апстримов с балансировкой по нескольким аккаунтам, ретраями,
-учётом rate-limit'ов и стоимости.
+`kou-router` is a Rust + axum LLM gateway. It accepts OpenAI-compatible,
+Anthropic Messages, OpenAI Responses, Gemini, and Ollama-style requests,
+translates between protocols, and routes them to configured upstream providers
+with retries, account-level failover, rate-limit handling, and cost tracking.
 
-- **Язык:** Rust 2024
-- **HTTP:** axum 0.8 + tower-http (CORS, tracing)
-- **Хранилище:** SQLite (sqlx, runtime-tokio-rustls)
-- **HTTP клиент апстрима:** reqwest + rustls
-- **Порт по умолчанию:** `0.0.0.0:20128`
+- Language: Rust 2024
+- HTTP server: axum 0.8 + tower-http
+- Storage: SQLite through sqlx
+- Upstream client: reqwest + rustls
+- Default port: `0.0.0.0:20128`
 
----
+## Features
 
-## Что умеет
+- Universal proxy for OpenAI Chat Completions, OpenAI Responses, Anthropic
+  Messages, Gemini, Ollama, embeddings, images, music, video, moderation,
+  rerank, search, TTS, and STT endpoints.
+- Protocol translation for request bodies, responses, and SSE streams.
+- Multiple accounts per provider connection, with priorities, enable/disable,
+  account-level proxy settings, backoff, and circuit breaking.
+- OAuth support for Claude/Anthropic and Codex/ChatGPT-style accounts through
+  PKCE, including proactive token refresh and one retry after upstream 401.
+- Built-in provider presets for common API-key, OAuth, and search providers.
+- Web admin UI, embedded into the Rust binary at compile time.
+- Optional Claude Code-compatible request fingerprinting for Anthropic routes.
+- API-key and JWT-cookie auth for proxy and management routes.
 
-- **Универсальный прокси.** Один и тот же запрос можно отправить в формате
-  OpenAI Chat Completions / Responses / Anthropic Messages / Gemini / Ollama —
-  роутер сам подберёт апстрим по `model`, переведёт payload и стрим в нужный
-  формат и приведёт ответ обратно к формату клиента.
-- **Несколько аккаунтов на провайдер.** На один `provider_connection` можно
-  привязать N `provider_account` (API-ключ или OAuth), с приоритетами,
-  включением/выключением, circuit-breaker'ом и backoff.
-- **OAuth.** Поддержаны Claude (Anthropic Console) и Codex (ChatGPT/Codex)
-  через PKCE-флоу, с автоматическим refresh.
-- **Rate-limit & retry.** Парсинг апстрим-хедеров (`x-ratelimit-*`,
-  `Retry-After`), внутренний tracker, экспоненциальный backoff с jitter.
-- **Стоимость.** Извлечение `usage` из ответа и расчёт по таблице цен.
-- **Claude Code fingerprint.** Опциональная подмена заголовков под
-  Claude Code CLI для запросов в Anthropic.
-- **Аудио.** `audio.speech` и multipart `audio.transcriptions`.
-- **Мультимодальность.** Images / Music / Video generation, embeddings,
-  moderations, rerank, search.
-- **Auth.** JWT-cookie для админки + bearer/`x-api-key` для клиентских
-  запросов. Скоупинг ключей по моделям.
+## Quick Start
 
----
+Prerequisites:
 
-## Быстрый старт
+- Rust toolchain
+- Bun, by default, for building the web UI
+
+The Rust build script builds the frontend automatically before embedding it.
+If `frontend/node_modules` is missing, it runs `bun install --frozen-lockfile`;
+then it runs `bun run build` and embeds `frontend/dist` with `rust-embed`.
 
 ```bash
-# сборка
+cargo run --release -- serve
+# First run: set the admin password for the web UI.
+# kou-router listening (web UI + API) on 0.0.0.0:20128
+```
+
+Equivalent:
+
+```bash
 cargo build --release
-
-# запуск
-cargo run --release
-# → kou-router listening on 0.0.0.0:20128
+./target/release/kou-router serve
 ```
 
-База создаётся автоматически при первом запуске
-(`sqlite://kou-router.db` по умолчанию).
+On first run, `kou-router` asks for an admin password in the terminal and
+enables auth immediately. In non-interactive environments such as Docker or
+systemd, set `KOU_ROUTER_ADMIN_PASSWORD`; without a TTY and without that
+variable, startup fails.
 
-### Переменные окружения
+The SQLite database is created automatically. The default DSN is
+`sqlite://kou-router.db`.
 
-**Базовые:**
+## Frontend Build
 
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `KOU_ROUTER_BIND` | `0.0.0.0:20128` | host:port, на котором слушает axum |
-| `KOU_ROUTER_DATABASE_URL` | `sqlite://kou-router.db` | SQLite DSN |
-| `RUST_LOG` / `EnvFilter` | `kou_router=info,tower_http=info` | tracing-фильтр |
+Frontend embedding is automatic during Cargo builds.
 
-**Claude Code fingerprint** (`src/fingerprint.rs`).
+Environment knobs:
 
-При проксировании в Anthropic роутер по умолчанию маскирует запрос под
-официальный Claude Code CLI: подсовывает `User-Agent: claude-cli/...`,
-заголовок `x-anthropic-billing-header`, `x-claude-code-session-id`, набор
-`anthropic-beta` фич (prompt-caching-scope, fast-mode, context-1m,
-structured-outputs и т.д.), и инжектит `metadata.user_id` в body. Это нужно
-чтобы (а) попасть в Claude-Code billing-cohort, (б) получить доступ к
-1P-only beta-флагам, недоступным обычному API.
+| Variable | Default | Description |
+|---|---:|---|
+| `KOU_FRONTEND_PACKAGE_MANAGER` | `bun` | Package manager used by `build.rs`; supports `bun`, `npm`, `pnpm`, `yarn`. |
+| `KOU_SKIP_FRONTEND_BUILD` | unset | Truthy value skips the frontend build and only ensures `frontend/dist` exists. Useful for quick backend-only experiments. |
+| `KOU_FRONTEND_DIST` | unset | Runtime override: serve the UI from this directory instead of embedded assets. |
 
-⚠️ Подмена нарушает Anthropic ToS. На свой страх и риск.
-
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `KOU_CC_FINGERPRINT` | `1` (включено) | `0` / `false` — выключить всю подмену |
-| `KOU_CC_VERSION` | `2.2.0` | Версия Claude Code CLI, под которую косим |
-| `KOU_CC_ENTRYPOINT` | `cli` | Метка в `cc_entrypoint` billing-хедера и UA (`cli`/`sdk`/`vscode`/...) |
-| `KOU_CC_USER_TYPE` | `external` | `external` / `internal` (Anthropic employees) |
-| `KOU_CC_WORKLOAD` | — | Тег для billing attribution (e.g. `cron-task`) |
-| `KOU_CC_AGENT_SDK_VERSION` | — | Версия Agent SDK, добавляется в UA |
-| `KOU_CC_DEVICE_ID` | auto | Переопределить device_id (ровно 64 hex chars). По умолчанию генерится один раз и кешируется в `~/.config/kou-router/device_id` |
-| `KOU_CC_ANT_INTERNAL` | `0` | Включить ant-internal beta `cli-internal-2026-02-09` |
-| `CLAUDE_CODE_ADDITIONAL_PROTECTION` / `KOU_CC_ADDITIONAL_PROTECTION` | — | Truthy → отправить заголовок `x-anthropic-additional-protection: true` (для Anthropic-environment-restricted clients) |
-| `CLAUDE_CODE_CONTAINER_ID` / `KOU_CC_REMOTE_CONTAINER_ID` | — | Значение заголовка `x-claude-remote-container-id` (для Claude Code remote-container режима) |
-| `CLAUDE_CODE_REMOTE_SESSION_ID` / `KOU_CC_REMOTE_SESSION_ID` | — | Значение `x-claude-remote-session-id` |
-| `CLAUDE_CODE_CLIENT_APP` / `KOU_CC_CLIENT_APP` | — | Свой `client-app/...` маркер в UA и отдельный заголовок `x-client-app` |
-| `ANTHROPIC_CUSTOM_HEADERS` / `KOU_CC_CUSTOM_HEADERS` | — | newline-separated `Name: Value` пары, которые роутер добавит к каждому Anthropic-запросу (но НЕ перепишет заголовки клиента) |
-| `KOU_CC_CLAUDE_TOKEN_URL` | `https://console.anthropic.com/v1/oauth/token` | Переопределить Anthropic OAuth token endpoint (используется при exchange и refresh; предназначен для тестов) |
-
-#### Auto OAuth
-
-Если роутер проксирует запрос через `provider_account` с `auth_mode = oauth` на Anthropic 1P (provider в [`anthropic`, `claude-oauth`] или base_url с `api.anthropic.com`):
-- `anthropic-beta` автоматически включает `oauth-2025-04-20` (раньше гейт через `KOU_CC_OAUTH`).
-- `metadata.user_id.account_uuid` в body заполняется из `provider_account.remote_account_id` (который вытаскивается из token-response: `account.uuid` или JWT.sub).
-
-Для Foundry/Vertex/Bedrock OAuth бета НЕ включается — это Anthropic-специфичный флаг.
-
-#### Token refresh
-
-Для OAuth-аккаунтов роутер делает два вида refresh:
-1. **Проактивный:** если `expires_at` меньше чем через 5 минут (буфер), роутер вызывает OAuthService::refresh ДО отправки запроса.
-2. **На 401:** если апстрим всё-таки ответил 401 (ревок, server-side expiry), роутер форсирует refresh и повторяет запрос один раз. Если второй раз тоже 401 — ошибка пробрасывается клиенту.
-
-### Тесты
+For UI development, run Vite directly and keep the backend running:
 
 ```bash
-cargo test
+cargo run -- serve
+cd frontend
+bun install
+bun run dev
 ```
 
-Интеграционные тесты лежат в `tests/`:
-- `integration.rs` — основной роутинг и трансляция.
-- `auth_integration.rs` — setup / login / API-keys.
-- `error_cases.rs` — ошибки апстрима, валидация.
-- `routing_advanced.rs` — приоритеты, fallback, alias'ы.
+The Vite dev server proxies `/api`, `/v1`, and `/health` to
+`http://127.0.0.1:20128` by default. Override with `KOU_BACKEND`.
 
----
+## Run Modes
+
+```bash
+kou-router [serve]            # web UI + API, binds 0.0.0.0:20128 by default
+kou-router daemon             # headless API, binds 127.0.0.1:20128 by default
+kou-router serve --bind 0.0.0.0:8080 --db sqlite:///var/lib/kou/kou.db
+```
+
+- `serve`: full web UI plus API. Non-API paths fall back to the SPA.
+- `daemon`: API-only mode for local agent tools. `GET /` returns service-info
+  JSON for discovery.
+
+Agent/client setup examples:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:20128/v1
+export ANTHROPIC_BASE_URL=http://127.0.0.1:20128
+```
+
+## Docker
+
+```bash
+docker build -t kou-router .
+docker run -d -p 20128:20128 \
+  -e KOU_ROUTER_ADMIN_PASSWORD='your-password-here' \
+  -v kou-data:/data \
+  kou-router
+```
+
+Or:
+
+```bash
+KOU_ROUTER_ADMIN_PASSWORD='your-password-here' docker compose up -d
+```
+
+The Docker image builds the frontend and embeds it into the release binary.
+Runtime data lives in `/data` and uses `sqlite:///data/kou-router.db`.
+
+`KOU_ROUTER_ADMIN_PASSWORD` is authoritative: each startup with this variable
+set updates the stored admin password to that value.
+
+## Environment
+
+Core variables:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `KOU_ROUTER_BIND` | `0.0.0.0:20128` in `serve`, `127.0.0.1:20128` in `daemon` | Bind address. CLI `--bind` wins. |
+| `KOU_ROUTER_DATABASE_URL` | `sqlite://kou-router.db` | SQLite DSN. CLI `--db` wins. |
+| `KOU_ROUTER_ADMIN_PASSWORD` | unset | Non-interactive admin password bootstrap/update. |
+| `KOU_FRONTEND_DIST` | unset | Runtime UI asset override. |
+| `RUST_LOG` | `kou_router=info,tower_http=info` | tracing filter. |
+
+Claude Code fingerprint variables:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `KOU_CC_FINGERPRINT` | `1` | `0` or `false` disables fingerprint injection. |
+| `KOU_CC_VERSION` / `CLAUDE_CODE_VERSION` | `2.1.173` | Claude Code CLI version used in UA and billing attribution. |
+| `CLAUDE_CODE_ENTRYPOINT` / `KOU_CC_ENTRYPOINT` | `cli` | Entry point marker for UA and billing attribution. |
+| `KOU_CC_USER_TYPE` | `external` | User type marker. |
+| `KOU_CC_WORKLOAD` | unset | Optional workload marker. |
+| `CLAUDE_AGENT_SDK_VERSION` / `KOU_CC_AGENT_SDK_VERSION` | unset | Agent SDK version marker for the UA. |
+| `KOU_CC_DEVICE_ID` | auto | Override stable 64-hex device id. |
+| `KOU_CC_ANT_INTERNAL` | `0` | Enables `cli-internal-2026-02-09`. |
+| `CLAUDE_CODE_ADDITIONAL_PROTECTION` / `KOU_CC_ADDITIONAL_PROTECTION` | unset | Truthy value sends `x-anthropic-additional-protection: true`. |
+| `CLAUDE_CODE_CONTAINER_ID` / `KOU_CC_REMOTE_CONTAINER_ID` | unset | Sends `x-claude-remote-container-id`. |
+| `CLAUDE_CODE_REMOTE_SESSION_ID` / `KOU_CC_REMOTE_SESSION_ID` | unset | Sends `x-claude-remote-session-id`. |
+| `CLAUDE_AGENT_SDK_CLIENT_APP` / `CLAUDE_CODE_CLIENT_APP` / `KOU_CC_CLIENT_APP` | unset | Client app marker for UA and `x-client-app`. |
+| `CLAUDE_CODE_AGENT_ID` / `KOU_CC_AGENT_ID` | unset | Sends `x-claude-code-agent-id`. |
+| `CLAUDE_CODE_PARENT_AGENT_ID` / `KOU_CC_PARENT_AGENT_ID` | unset | Sends `x-claude-code-parent-agent-id`. |
+| `ANTHROPIC_CUSTOM_HEADERS` / `KOU_CC_CUSTOM_HEADERS` | unset | Newline-separated `Name: Value` headers added to Anthropic requests without overwriting client headers. |
+| `KOU_CC_CLAUDE_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | Anthropic OAuth token endpoint override for tests. |
+
+When `kou-router` has to synthesize Claude Code headers, it uses a conservative
+`anthropic-beta` set: `claude-code`, `interleaved-thinking`, `effort`,
+`prompt-caching-scope`, `context-1m` only for explicit `[1m]` or Sonnet/Opus
+4.6+, OAuth beta for Anthropic OAuth accounts, and safe 3P/Vertex betas where
+applicable. If the client already supplied `anthropic-beta`, the router keeps
+that value unchanged and only fills in missing Claude Code headers.
+
+## OAuth and Token Refresh
+
+Claude/Anthropic and Codex/ChatGPT OAuth providers use PKCE. OAuth accounts can
+be attached to a provider connection and used for inference just like API-key
+accounts.
+
+Refresh behavior:
+
+1. Proactive refresh before inference if `expires_at` is less than five minutes
+   away.
+2. Forced refresh and one retry if upstream returns 401.
+
+For Anthropic first-party OAuth accounts, the `oauth-2025-04-20` beta is added
+automatically and `metadata.user_id.account_uuid` is filled from the remote
+account id extracted during OAuth.
 
 ## HTTP API
 
-Все ответы — JSON, кроме SSE-стримов (`text/event-stream`) и аудио
-(`audio/*`). Любой роут может вернуть `_kou_router` отладочный блок (для
-не-стрим JSON) или `x-kou-debug` заголовок (для стрима).
+All JSON proxy routes accept a `model` field, select provider/account routing,
+and then proxy to the upstream. Streaming is enabled with `"stream": true`.
 
-Сквозные хедеры:
-- `x-request-id` / `x-client-request-id` — переиспользуется или генерится
-  UUID v4, всегда возвращается клиенту.
-- `x-ratelimit-*`, `retry-after` — пробрасываются с апстрима.
+Health:
 
-### Health
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Basic health JSON. |
 
-| Метод | Путь       | Описание |
-|-------|------------|----------|
-| GET   | `/health`  | `{ "ok": true, "service": "kou-router" }` |
+Model lists:
 
-### Inference / proxy (OpenAI-совместимые)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1` | Alias for `/v1/models`. |
+| `GET` | `/v1/models` | All enabled provider models. |
+| `GET` | `/v1/embeddings` | Embedding-capable models. |
+| `GET` | `/v1/images/generations` | Image-capable models. |
+| `GET` | `/v1/music/generations` | Music-capable models. |
+| `GET` | `/v1/videos/generations` | Video-capable models. |
+| `GET` | `/v1/search` | Search providers/models. |
 
-Все принимают произвольный JSON, читают `model`, выбирают provider+account и
-проксируют. Поддерживают streaming (`"stream": true`).
+Proxy routes:
 
-| Метод | Путь | Эндпоинт | Описание |
-|-------|------|----------|----------|
-| GET   | `/v1`                       | — | Список моделей (alias на `/v1/models`) |
-| GET   | `/v1/models`                | — | Список всех моделей всех включённых провайдеров |
-| POST  | `/v1/chat/completions`      | `chat.completions` | OpenAI Chat Completions |
-| POST  | `/v1/completions`           | `completions` | OpenAI legacy completions |
-| POST  | `/v1/messages`              | `messages` | Anthropic Messages |
-| POST  | `/v1/messages/count_tokens` | — | **Сырой** прокси `messages/count_tokens` без трансляции |
-| POST  | `/v1/responses`             | `responses` | OpenAI Responses API |
-| POST  | `/v1/responses/{*path}`     | `responses` | Подэндпоинты Responses (e.g. `/cancel`) |
-| POST  | `/v1/api/chat`              | `ollama.chat` | Ollama-style chat |
-| GET   | `/v1/embeddings`            | — | Список моделей с capability=embeddings |
-| POST  | `/v1/embeddings`            | `embeddings` | Эмбеддинги |
-| GET   | `/v1/images/generations`    | — | Список image-моделей |
-| POST  | `/v1/images/generations`    | `images.generations` | Генерация картинок |
-| GET   | `/v1/music/generations`     | — | Список music-моделей |
-| POST  | `/v1/music/generations`     | `music.generations` | Генерация музыки |
-| GET   | `/v1/videos/generations`    | — | Список video-моделей |
-| POST  | `/v1/videos/generations`    | `videos.generations` | Генерация видео |
-| POST  | `/v1/moderations`           | `moderations` | Модерация |
-| POST  | `/v1/rerank`                | `rerank` | Rerank-модели (Cohere/Voyage style) |
-| GET   | `/v1/search`                | — | Список search-провайдеров |
-| POST  | `/v1/search`                | `search` | Web-search (Tavily/Exa/Serper/Brave/Perplexity) |
-| POST  | `/v1/audio/speech`          | `audio.speech` | TTS, возвращает бинарный аудиопоток |
-| POST  | `/v1/audio/transcriptions`  | `audio.transcriptions` | STT, multipart-form-data |
+| Method | Path | Endpoint |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/completions` | OpenAI legacy completions |
+| `POST` | `/v1/messages` | Anthropic Messages |
+| `POST` | `/v1/messages/count_tokens` | Raw Anthropic count_tokens proxy |
+| `POST` | `/v1/responses` | OpenAI Responses |
+| `POST` | `/v1/responses/{*path}` | OpenAI Responses subroutes |
+| `POST` | `/v1/api/chat` | Ollama chat |
+| `POST` | `/v1/embeddings` | Embeddings |
+| `POST` | `/v1/images/generations` | Image generation |
+| `POST` | `/v1/music/generations` | Music generation |
+| `POST` | `/v1/videos/generations` | Video generation |
+| `POST` | `/v1/moderations` | Moderation |
+| `POST` | `/v1/rerank` | Rerank |
+| `POST` | `/v1/search` | Web search |
+| `POST` | `/v1/audio/speech` | TTS, returns binary audio |
+| `POST` | `/v1/audio/transcriptions` | STT, multipart form-data |
 
-**Аутентификация прокси.** Если включён `require_auth` (см. ниже), нужен
-`Authorization: Bearer <api_key>` или `x-api-key: <api_key>` (Claude Code).
-Иначе анонимно.
+Proxy auth:
 
-### Управление провайдерами (`/api/providers`)
+- If auth is disabled, proxy routes are anonymous.
+- If auth is enabled, pass `Authorization: Bearer <api_key>` or
+  `x-api-key: <api_key>`.
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET   | `/api/providers`           | Все `provider_connection` |
-| POST  | `/api/providers`           | Создать вручную |
-| GET   | `/api/providers/presets`   | Список встроенных пресетов |
-| POST  | `/api/providers/import`    | Импортировать пресет (см. список ниже) |
+Management routes:
 
-**Body для `import`:**
-```json
-{
-  "preset_id": "openai",
-  "name": "My OpenAI",
-  "api_key": "sk-...",
-  "model_prefix": "openai/",
-  "enabled": true,
-  "priority": 100,
-  "rate_limit_protection": true
-}
-```
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/providers` | List provider connections. |
+| `POST` | `/api/providers` | Create provider connection. |
+| `GET` | `/api/providers/presets` | List built-in presets. |
+| `POST` | `/api/providers/import` | Import a preset. |
+| `GET` | `/api/provider-accounts?provider_connection_id=...` | List accounts. |
+| `POST` | `/api/provider-accounts` | Create API-key or OAuth account stub. |
+| `POST` | `/api/provider-accounts/oauth/start` | Start OAuth. |
+| `POST` | `/api/provider-accounts/oauth/callback` | Finish OAuth. |
+| `POST` | `/api/provider-accounts/{id}/refresh` | Force token refresh. |
+| `POST` | `/api/provider-accounts/{id}/proxy` | Set or clear per-account proxy. |
+| `POST` | `/api/provider-accounts/{id}/enable` | Enable account. |
+| `POST` | `/api/provider-accounts/{id}/disable` | Disable account. |
+| `DELETE` | `/api/provider-accounts/{id}` | Delete account. |
+| `GET` | `/api/combos` | List combos. |
+| `POST` | `/api/combos` | Create combo. |
+| `GET` | `/api/models/alias` | List model aliases. |
+| `POST` | `/api/models/alias` | Upsert alias. |
+| `GET` | `/api/settings` | Read settings. |
+| `POST` | `/api/settings` | Save settings. |
+| `GET` | `/api/ratelimits` | In-memory rate-limit snapshot. |
+| `GET` | `/api/logs` | List request logs. |
+| `GET` | `/api/logs/{id}` | Request log detail. |
 
-### Provider accounts (`/api/provider-accounts`) — **Management auth**
+Auth routes:
 
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET    | `/api/provider-accounts?provider_connection_id=...` | Список аккаунтов в провайдере |
-| POST   | `/api/provider-accounts`                            | Создать аккаунт (api_key или oauth-стаб) |
-| POST   | `/api/provider-accounts/oauth/start`                | Стартовать OAuth-авторизацию |
-| POST   | `/api/provider-accounts/oauth/callback`             | Завершить OAuth (`state` + `code`) |
-| POST   | `/api/provider-accounts/{id}/refresh`               | Принудительно обновить токен |
-| POST   | `/api/provider-accounts/{id}/proxy`                 | Задать или убрать прокси аккаунта |
-| POST   | `/api/provider-accounts/{id}/enable`                | Включить |
-| POST   | `/api/provider-accounts/{id}/disable`               | Выключить |
-| DELETE | `/api/provider-accounts/{id}`                       | Удалить |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/auth/status` | `{ auth_required, setup_complete }`. |
+| `POST` | `/api/auth/setup` | First-time setup for embedded/library use. |
+| `POST` | `/api/auth/login` | Sets `kou_auth` JWT cookie. |
+| `POST` | `/api/auth/logout` | Clears the cookie. |
+| `GET` | `/api/keys` | List API keys without secrets. |
+| `POST` | `/api/keys` | Create API key; returns the secret once. |
+| `DELETE` | `/api/keys/{id}` | Revoke API key. |
 
-**OAuth start body:**
-```json
-{
-  "provider_connection_id": "uuid",
-  "provider_account_id": "uuid (optional, для re-auth)",
-  "redirect_uri": "http://localhost:1455/auth/callback"
-}
-```
+## Provider Presets
 
-Возвращает `{ session, authorization_url }`. Дальше клиент открывает URL в
-браузере, ловит `code`+`state` на своём редиректе и шлёт их в `/oauth/callback`.
+API-key style:
 
-### Proxy per account
-
-Каждый аккаунт может ходить в апстрим через свой HTTP/HTTPS/SOCKS5 прокси.
-Прокси задаётся при создании аккаунта или отдельным роутом:
-
-```bash
-curl -sX POST http://127.0.0.1:20128/api/provider-accounts/<id>/proxy \
-  -b /tmp/kou.cookie \
-  -H 'content-type: application/json' \
-  -d '{"proxy_url": "socks5h://user:pass@host:1080"}'
-```
-
-Чтобы убрать прокси: `{"proxy_url": null}` или пустая строка.
-
-При OAuth можно сразу привязать прокси к новому аккаунту, передав `proxy_url` в
-`POST /api/provider-accounts/oauth/start`. Прокси используется и для
-inference-запросов, и для token-refresh, и для первого token-exchange.
-
-Стандартные `HTTP_PROXY` / `HTTPS_PROXY` env-переменные **не** учитываются —
-только это поле.
-
-### Combos / Aliases / Settings / Ratelimits
-
-| Метод | Путь | Auth | Описание |
-|-------|------|------|----------|
-| GET   | `/api/combos`        | — | Список комбинаций (provider+model) |
-| POST  | `/api/combos`        | — | Создать комбо |
-| GET   | `/api/models/alias`  | — | Список алиасов моделей |
-| POST  | `/api/models/alias`  | — | Upsert алиаса (`{ "alias": "...", "target": "provider/model" }`) |
-| GET   | `/api/settings`      | — | Получить settings JSON |
-| POST  | `/api/settings`      | — | Сохранить settings (private/public splits) |
-| GET   | `/api/ratelimits`    | — | Снимок rate-limit tracker'а по всем (provider, model) |
-
-### Auth (публичные)
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET   | `/api/auth/status` | `{ auth_required, setup_complete }` |
-| POST  | `/api/auth/setup`  | Первичная настройка: задать пароль админа, включить auth, сгенерить JWT-secret |
-| POST  | `/api/auth/login`  | `{ password }` → выставляет cookie `kou_auth=<JWT>; HttpOnly; SameSite=Lax; Max-Age=86400` |
-| POST  | `/api/auth/logout` | Стирает cookie |
-
-`setup` принимает `{ "password": "min 8 chars" }` и срабатывает только пока
-`admin_password_hash` пустой.
-
-### API keys (`/api/keys`) — **Management auth**
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET    | `/api/keys`        | Список ключей (без секретов) |
-| POST   | `/api/keys`        | Создать ключ. Возвращает `key` ровно один раз |
-| DELETE | `/api/keys/{id}`   | Отозвать |
-
-**Создание:**
-```json
-{ "name": "claude-code-laptop", "allowed_models": ["openai/gpt-4o-mini", "anthropic/claude-*"] }
-```
-
-`allowed_models` — белый список (точные имена или wildcard `*`). Пустой =
-любые модели.
-
-### Auth-модель в двух словах
-
-- **Anonymous mode** (`require_auth=false`, дефолт после `cargo run` без
-  setup) — все роуты открыты.
-- **Authenticated mode** (`require_auth=true` после `auth/setup`):
-  - Прокси-роуты (`/v1/*`) → `ProxyAuth`: bearer / `x-api-key`.
-  - Управляющие (`/api/keys`, `/api/provider-accounts`) → `ManagementAuth`:
-    JWT-cookie `kou_auth` **или** bearer/`x-api-key`.
-
----
-
-## Встроенные провайдер-пресеты
-
-`GET /api/providers/presets` возвращает все эти ID — их можно скармливать в
-`/api/providers/import`:
-
-**OpenAI-style API key:**
 `openai`, `anthropic`, `openrouter`, `deepseek`, `groq`, `xai`, `mistral`,
 `together`, `fireworks`, `cohere`, `nvidia`, `nebius`, `hyperbolic`,
 `huggingface`, `vertex`, `alibaba`, `cloudflare-ai`, `aimlapi`,
 `pollinations`, `glm`, `kimi`
 
-**Search API:**
+Search:
+
 `serper-search`, `brave-search`, `exa-search`, `tavily-search`,
 `perplexity-search`
 
-**OAuth:**
+OAuth:
+
 `claude-oauth`, `antigravity`, `codex`, `github-copilot`
 
----
+## Per-Account Proxy
 
-## Структура проекта
+Each provider account can use its own HTTP, HTTPS, SOCKS5, or SOCKS5h proxy.
+This proxy is used for inference, token refresh, and first token exchange.
+Standard `HTTP_PROXY` / `HTTPS_PROXY` environment variables are intentionally
+not used for provider traffic.
 
-```
-src/
-├── main.rs             # entrypoint, init_db + axum::serve
-├── lib.rs              # реэкспорты модулей
-├── app.rs              # build_app: router + TraceLayer + CORS
-├── routes.rs           # все HTTP-хендлеры и AppState
-├── service.rs          # RouterService — выбор провайдера, ретраи, fallback
-├── upstream.rs         # HTTP-клиент к апстриму, passthrough headers
-├── repository.rs       # SQLite репо (provider_connections, accounts,
-│                       #   api_keys, settings, combos, aliases, oauth_sessions)
-├── db.rs               # init_db, миграции
-├── models.rs           # доменные типы + EndpointKind
-├── presets.rs          # встроенные пресеты провайдеров
-├── error.rs            # AppError, классификация upstream-ошибок
-├── search.rs           # web-search адаптеры
-├── audio.rs            # TTS / STT (multipart)
-├── auth/
-│   ├── mod.rs          # реэкспорты, AuthContext
-│   ├── api_key.rs      # генерация/хеширование (sha256)
-│   ├── jwt.rs          # подпись/проверка JWT (HS256)
-│   ├── middleware.rs   # ProxyAuth + ManagementAuth extractor'ы
-│   ├── models.rs       # AuthStatus, LoginRequest, ApiKeyRecord, ...
-│   └── password.rs     # argon2
-├── oauth/
-│   ├── mod.rs          # PKCE, state, парсинг JWT
-│   ├── service.rs      # OAuthService — start/complete/refresh
-│   ├── claude.rs       # Anthropic Console OAuth
-│   └── codex.rs        # ChatGPT/Codex OAuth
-├── translate/
-│   ├── mod.rs          # реэкспорты
-│   ├── registry.rs     # выбор адаптера по (src_protocol, dst_protocol)
-│   ├── common.rs       # хелперы (роли, контент-блоки, tools)
-│   ├── format.rs       # детектирование формата ответа
-│   ├── stream.rs       # перекодировка SSE
-│   ├── claude_to_openai.rs
-│   ├── openai_to_claude.rs
-│   ├── openai_to_gemini.rs
-│   ├── gemini_to_openai.rs
-│   └── ollama.rs
-├── cost.rs             # ModelPricing, UsageInfo, расчёт $
-├── ratelimit.rs        # RateLimitInfo, RateLimitTracker (in-memory)
-├── retry.rs            # RetryConfig, exponential backoff с jitter
-└── fingerprint.rs      # ClaudeCodeFingerprint — заголовки/metadata под Claude Code
-```
-
----
-
-## Скрипты
-
-### `scripts/codex_oauth_test.py`
-
-Self-contained Python-скрипт (только stdlib, без зависимостей) для end-to-end
-проверки Codex OAuth-флоу против запущенного `kou-router`.
-
-Что делает:
-1. Поднимает локальный HTTP-сервер для callback (по умолчанию
-   `http://localhost:1455/auth/callback`).
-2. Через `POST /api/providers/import` импортирует пресет `codex` (или
-   реюзает существующий `--provider-connection-id`).
-3. Дёргает `POST /api/provider-accounts/oauth/start`, получает
-   `authorization_url`.
-4. Открывает URL в браузере (`webbrowser.open`).
-5. Ловит callback (`code`+`state`), отправляет в
-   `POST /api/provider-accounts/oauth/callback`.
-6. Печатает финальный `provider_account_id` + флаги
-   `has_access_token`/`has_refresh_token`.
-
-**Запуск:**
 ```bash
-python3 scripts/codex_oauth_test.py \
-  --base-url http://127.0.0.1:20128 \
-  --cookie "kou_auth=<JWT>"        # или просто "<JWT>", скрипт сам обернёт
+curl -sX POST http://127.0.0.1:20128/api/provider-accounts/<id>/proxy \
+  -H 'content-type: application/json' \
+  -b 'kou_auth=<JWT>' \
+  -d '{"proxy_url": "socks5h://user:pass@host:1080"}'
 ```
 
-**Все опции:**
-| Флаг | По умолчанию | Назначение |
-|---|---|---|
-| `--base-url` | `http://127.0.0.1:20128` | URL роутера |
-| `--cookie` | — | JWT или `kou_auth=...` для management-auth |
-| `--provider-connection-id` | — | Реюзать существующее подключение |
-| `--provider-name` | `Codex OAuth Test` | Имя при импорте пресета |
-| `--listen-host` | `localhost` | Хост callback-сервера |
-| `--listen-port` | `1455` | Порт callback-сервера |
-| `--callback-path` | `/auth/callback` | Путь callback'а |
-| `--no-browser` | — | Не открывать браузер, просто напечатать URL |
+Clear it with `{"proxy_url": null}` or an empty string.
 
-Exit codes: `0` ok, `1` ошибка скрипта/апстрима, `130` Ctrl+C.
+## Tests
 
----
+```bash
+cargo test
+```
 
-## Лицензия
+Useful focused suites:
 
-Internal / private. См. владельца репозитория.
+```bash
+cargo test --test fingerprint_integration
+cargo test --lib test_beta_headers
+cargo test --lib test_generate_headers
+```
+
+## Project Layout
+
+```text
+src/
+  main.rs             CLI entrypoint and server bootstrap
+  app.rs              app builders: UI+API and headless daemon
+  ui.rs               embedded web UI, SPA fallback, login gate
+  routes.rs           HTTP handlers
+  service.rs          routing, translation, retry, fallback
+  upstream.rs         upstream HTTP client and header handling
+  repository.rs       SQLite repository
+  db.rs               schema initialization and migrations
+  models.rs           domain types and EndpointKind
+  presets.rs          built-in provider presets
+  auth/               admin JWT, API keys, auth extractors
+  oauth/              PKCE sessions and provider-specific OAuth
+  translate/          protocol translators and SSE adapters
+  fingerprint.rs      Claude Code-compatible header/body attribution
+  search.rs           search provider adapters
+  audio.rs            TTS/STT routing
+  cost.rs             usage and cost extraction
+  ratelimit.rs        rate-limit parsing and in-memory tracker
+  retry.rs            retry and backoff
+frontend/
+  src/                React/Vite admin UI
+  dist/               generated at build time, not committed
+build.rs              auto-builds frontend and prepares embedded assets
+```
+
+## Local Files and Secrets
+
+Runtime databases (`*.db`), `/data`, `.vix`, downloaded upstream binaries, and
+root-level visual scratch artifacts are ignored. Do not commit local SQLite
+databases: they may contain provider tokens, API-key hashes, OAuth refresh
+tokens, or request logs.
+
+## License
+
+No license has been declared yet.

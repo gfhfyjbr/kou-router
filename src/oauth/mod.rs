@@ -1,3 +1,4 @@
+pub mod callback_server;
 mod claude;
 mod codex;
 pub mod service;
@@ -30,6 +31,8 @@ pub(crate) struct OAuthTokenGrant {
     pub(crate) scopes: Option<Vec<String>>,
     pub(crate) remote_account_id: Option<String>,
     pub(crate) remote_email: Option<String>,
+    pub(crate) is_fedramp: bool,
+    pub(crate) api_key: Option<String>,
 }
 
 pub(crate) fn generate_pkce() -> OAuthPkce {

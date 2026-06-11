@@ -252,6 +252,63 @@ pub fn extract_usage(body: &Value) -> Option<UsageInfo> {
     None
 }
 
+/// Extract usage from an SSE transcript by scanning `data:` events.
+///
+/// Handles the three streaming shapes the router relays:
+/// - OpenAI chat: a final chunk carrying a full `usage` object
+/// - OpenAI responses: `response.completed` with usage under `response`
+/// - Anthropic messages: input tokens on `message_start` (under `message`),
+///   output tokens trickling in on `message_delta`
+pub fn extract_usage_from_sse(transcript: &str) -> Option<UsageInfo> {
+    let mut input = 0_u64;
+    let mut output = 0_u64;
+    let mut cache_read: Option<u64> = None;
+    let mut cache_creation: Option<u64> = None;
+
+    for line in transcript.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        for candidate in [Some(&value), value.get("response"), value.get("message")]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(usage) = extract_usage(candidate) {
+                if usage.input_tokens > 0 {
+                    input = usage.input_tokens;
+                }
+                if usage.output_tokens > 0 {
+                    output = usage.output_tokens;
+                }
+                if usage.cache_read_tokens.is_some() {
+                    cache_read = usage.cache_read_tokens;
+                }
+                if usage.cache_creation_tokens.is_some() {
+                    cache_creation = usage.cache_creation_tokens;
+                }
+            }
+        }
+    }
+
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(UsageInfo {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        total_tokens: input + output,
+    })
+}
+
 /// Calculate USD cost for a request.
 pub fn calculate_cost(model: &str, usage: &UsageInfo) -> f64 {
     let pricing = get_model_pricing(model);

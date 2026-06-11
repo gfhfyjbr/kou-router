@@ -29,7 +29,8 @@ impl TranslatorRegistry {
 
     fn register_all(&mut self) {
         use super::{
-            claude_to_openai, gemini_to_openai, ollama, openai_to_claude, openai_to_gemini, stream,
+            claude_to_openai, gemini_to_openai, ollama, openai_responses, openai_to_claude,
+            openai_to_gemini, stream,
         };
 
         // OpenAI -> Claude
@@ -63,6 +64,22 @@ impl TranslatorRegistry {
         self.response.insert(
             (ProtocolFormat::Ollama, ProtocolFormat::OpenAI),
             ollama::translate_response_to_openai,
+        );
+
+        // OpenAI chat -> OpenAI Responses
+        self.request.insert(
+            (ProtocolFormat::OpenAI, ProtocolFormat::OpenAIResponses),
+            openai_responses::openai_request_to_responses,
+        );
+        // Claude Messages -> OpenAI Responses
+        self.request.insert(
+            (ProtocolFormat::Claude, ProtocolFormat::OpenAIResponses),
+            openai_responses::claude_request_to_responses,
+        );
+        // OpenAI Responses -> OpenAI chat
+        self.response.insert(
+            (ProtocolFormat::OpenAIResponses, ProtocolFormat::OpenAI),
+            openai_responses::responses_response_to_openai,
         );
 
         // Stream chunk translators

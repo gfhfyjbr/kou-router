@@ -5,9 +5,7 @@ use rand::Rng;
 use crate::{
     error::{AppResult, UpstreamErrorKind, classify_upstream_error},
     models::{EndpointKind, ProviderConnection},
-    upstream::{
-        PassthroughHeaders, PreparedUpstreamRequest, UpstreamClient, UpstreamResult,
-    },
+    upstream::{PassthroughHeaders, PreparedUpstreamRequest, UpstreamClient, UpstreamResult},
 };
 
 /// Configuration for retry behavior.

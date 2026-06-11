@@ -32,7 +32,7 @@ pub struct OAuthContext {
 /// and metadata to mimic a Claude Code client.
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeFingerprint {
-    /// Claude Code CLI version (default "2.2.0", configurable via KOU_CC_VERSION)
+    /// Claude Code CLI version (default "2.1.173", configurable via KOU_CC_VERSION)
     version: String,
     /// 64 hex-char device identifier, stable per machine (persisted to ~/.config/kou-router/device_id)
     device_id: String,
@@ -40,16 +40,19 @@ pub struct ClaudeCodeFingerprint {
     session_id: String,
     /// Whether fingerprint injection is enabled (KOU_CC_FINGERPRINT env var)
     enabled: bool,
-    /// Entrypoint identifier (default "cli", configurable via KOU_CC_ENTRYPOINT)
+    /// Entrypoint identifier (default "cli", configurable via CLAUDE_CODE_ENTRYPOINT/KOU_CC_ENTRYPOINT)
     entrypoint: String,
     /// User type for User-Agent (default "external", configurable via KOU_CC_USER_TYPE)
     user_type: String,
     /// Optional workload tag for billing attribution (configurable via KOU_CC_WORKLOAD)
     workload: Option<String>,
-    /// Optional agent-sdk version for User-Agent (configurable via KOU_CC_AGENT_SDK_VERSION)
+    /// Optional agent-sdk version for User-Agent (configurable via CLAUDE_AGENT_SDK_VERSION/KOU_CC_AGENT_SDK_VERSION)
     agent_sdk_version: Option<String>,
-    /// Optional client-app identifier for User-Agent (configurable via CLAUDE_CODE_CLIENT_APP or KOU_CC_CLIENT_APP)
+    /// Optional client-app identifier for User-Agent (configurable via CLAUDE_AGENT_SDK_CLIENT_APP or KOU_CC_CLIENT_APP)
     client_app: Option<String>,
+    /// Optional agent id headers for agent/subagent sessions.
+    agent_id: Option<String>,
+    parent_agent_id: Option<String>,
     /// Whether to send x-anthropic-additional-protection header
     /// (env CLAUDE_CODE_ADDITIONAL_PROTECTION or KOU_CC_ADDITIONAL_PROTECTION).
     additional_protection: bool,
@@ -67,20 +70,28 @@ const FINGERPRINT_INDICES: [usize; 3] = [4, 7, 20];
 
 impl ClaudeCodeFingerprint {
     pub fn new() -> Self {
-        let version = std::env::var("KOU_CC_VERSION").unwrap_or_else(|_| "2.2.0".to_string());
+        let version = read_env_first(&["KOU_CC_VERSION", "CLAUDE_CODE_VERSION"])
+            .unwrap_or_else(|| "2.1.173".to_string());
         let enabled = std::env::var("KOU_CC_FINGERPRINT")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        let entrypoint = std::env::var("KOU_CC_ENTRYPOINT").unwrap_or_else(|_| "cli".to_string());
+        let entrypoint = read_env_first(&["CLAUDE_CODE_ENTRYPOINT", "KOU_CC_ENTRYPOINT"])
+            .unwrap_or_else(|| "cli".to_string());
         let user_type =
             std::env::var("KOU_CC_USER_TYPE").unwrap_or_else(|_| "external".to_string());
         let workload = std::env::var("KOU_CC_WORKLOAD")
             .ok()
             .filter(|v| !v.is_empty());
-        let agent_sdk_version = std::env::var("KOU_CC_AGENT_SDK_VERSION")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let client_app = read_env_first(&["CLAUDE_CODE_CLIENT_APP", "KOU_CC_CLIENT_APP"]);
+        let agent_sdk_version =
+            read_env_first(&["CLAUDE_AGENT_SDK_VERSION", "KOU_CC_AGENT_SDK_VERSION"]);
+        let client_app = read_env_first(&[
+            "CLAUDE_AGENT_SDK_CLIENT_APP",
+            "CLAUDE_CODE_CLIENT_APP",
+            "KOU_CC_CLIENT_APP",
+        ]);
+        let agent_id = read_env_first(&["CLAUDE_CODE_AGENT_ID", "KOU_CC_AGENT_ID"]);
+        let parent_agent_id =
+            read_env_first(&["CLAUDE_CODE_PARENT_AGENT_ID", "KOU_CC_PARENT_AGENT_ID"]);
         let additional_protection = read_env_bool(&[
             "CLAUDE_CODE_ADDITIONAL_PROTECTION",
             "KOU_CC_ADDITIONAL_PROTECTION",
@@ -110,6 +121,8 @@ impl ClaudeCodeFingerprint {
             workload,
             agent_sdk_version,
             client_app,
+            agent_id,
+            parent_agent_id,
             additional_protection,
             remote_container_id,
             remote_session_id,
@@ -183,20 +196,15 @@ impl ClaudeCodeFingerprint {
     /// `kind \in {FirstParty, Foundry}`. Some betas are only valid on 1P and sending
     /// them to 3P providers may cause errors.
     ///
-    /// Betas included:
+    /// Default betas are intentionally conservative. If the client supplies
+    /// `anthropic-beta`, passthrough merge keeps the client value unchanged.
+    ///
+    /// Betas included when the router has to synthesize Claude Code headers:
     /// - claude-code-20250219 (non-Haiku)
     /// - interleaved-thinking-2025-05-14 (non-claude-3-* models)
-    /// - redact-thinking-2026-02-12 (1P only, ISP-capable models)
-    /// - prompt-caching-scope-2026-01-05 (1P only)
     /// - effort-2025-11-24 (always)
-    /// - context-management-2025-06-27 (Claude 4+, 1P only)
-    /// - fast-mode-2026-02-01 (1P only)
-    /// - afk-mode-2026-01-31 (Claude 4+, 1P only)
-    /// - task-budgets-2026-03-13 (1P only)
-    /// - advisor-tool-2026-03-01 (1P only)
-    /// - context-1m-2025-08-07 (1P only, Claude 4+ with 1M context)
-    /// - structured-outputs-2025-12-15 (Claude 4.5+, 1P only)
-    /// - advanced-tool-use-2025-11-20 (1P only, tool search)
+    /// - prompt-caching-scope-2026-01-05 (1P only)
+    /// - context-1m-2025-08-07 (1P only, explicit `[1m]` or Sonnet/Opus 4.6+)
     /// - tool-search-tool-2025-10-19 (3P only, tool search)
     /// - cli-internal-2026-02-09 (1P only, ant-internal, gated by KOU_CC_ANT_INTERNAL)
     /// - oauth-2025-04-20 (1P only, when oauth.is_oauth_subscriber=true)
@@ -226,13 +234,6 @@ impl ClaudeCodeFingerprint {
             betas.push("interleaved-thinking-2025-05-14");
         }
 
-        // redact-thinking: 1P only, ISP-capable models (non-claude-3-*).
-        // In Claude Code this also checks !interactive && showThinkingSummaries !== true,
-        // but as a proxy we include it unconditionally for ISP models on 1P.
-        if is_first_party && !is_claude3 {
-            betas.push("redact-thinking-2026-02-12");
-        }
-
         // effort: always included
         betas.push("effort-2025-11-24");
 
@@ -241,37 +242,10 @@ impl ClaudeCodeFingerprint {
             // prompt-caching-scope: 1P only (global cache scope)
             betas.push("prompt-caching-scope-2026-01-05");
 
-            // context-management: Claude 4+ on 1P
-            if is_claude4_plus {
-                betas.push("context-management-2025-06-27");
-            }
-
-            // fast-mode: 1P only, server treats as no-op if not used
-            betas.push("fast-mode-2026-02-01");
-
-            // task-budgets: 1P only
-            betas.push("task-budgets-2026-03-13");
-
-            // advisor-tool: 1P only
-            betas.push("advisor-tool-2026-03-01");
-
             // context-1m: 1P only, for models with 1M extended context support
             if has_1m_context(&model_lower) {
                 betas.push("context-1m-2025-08-07");
             }
-
-            // afk-mode (auto mode): Claude 4+ on 1P
-            if is_claude4_plus {
-                betas.push("afk-mode-2026-01-31");
-            }
-
-            // structured-outputs: Claude 4.5+ on 1P
-            if is_claude45_or_newer(&model_lower) {
-                betas.push("structured-outputs-2025-12-15");
-            }
-
-            // tool-search: 1P/Foundry gets advanced-tool-use beta
-            betas.push("advanced-tool-use-2025-11-20");
 
             // cli-internal: ant-only, only when entrypoint is 'cli'.
             // Gated behind KOU_CC_ANT_INTERNAL env var since this is Anthropic-internal only.
@@ -289,11 +263,6 @@ impl ClaudeCodeFingerprint {
                 betas.push("oauth-2025-04-20");
             }
         } else {
-            // 3P: context-management for Claude 4+ (opus-4/sonnet-4)
-            if is_claude4_plus {
-                betas.push("context-management-2025-06-27");
-            }
-
             // tool-search: 3P (Vertex/Bedrock/Other) gets different beta name
             betas.push("tool-search-tool-2025-10-19");
 
@@ -352,10 +321,20 @@ impl ClaudeCodeFingerprint {
             ),
         ));
 
+        headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
         headers.push((
             "x-claude-code-session-id".to_string(),
             self.session_id.clone(),
         ));
+        if let Some(agent_id) = &self.agent_id {
+            headers.push(("x-claude-code-agent-id".to_string(), agent_id.clone()));
+        }
+        if let Some(parent_agent_id) = &self.parent_agent_id {
+            headers.push((
+                "x-claude-code-parent-agent-id".to_string(),
+                parent_agent_id.clone(),
+            ));
+        }
         // x-client-request-id: Only sent on 1P (firstParty API).
         // Unknown headers risk rejection by strict 3P proxies (inc-4029 class).
         if is_first_party {
@@ -537,29 +516,94 @@ fn is_claude4_or_newer(model_lower: &str) -> bool {
         || model_lower.contains("claude-haiku-4")
 }
 
-/// Check if a model name suggests Claude 4.5 or newer (for structured-outputs beta).
-/// Claude Code gates structured-outputs on specific 4.5+/4.6+ model IDs.
-fn is_claude45_or_newer(model_lower: &str) -> bool {
-    model_lower.contains("sonnet-4-5")
-        || model_lower.contains("sonnet-4-6")
-        || model_lower.contains("opus-4-1")
-        || model_lower.contains("opus-4-5")
-        || model_lower.contains("opus-4-6")
-        || model_lower.contains("haiku-4-5")
-        || model_lower.contains("claude-5")
-        || model_lower.contains("claude-6")
-}
-
-/// Check if a model has 1M extended context enabled — mirrors canonical Claude Code
-/// `has1mContext`: explicit `[1m]` suffix in the model name is the only opt-in.
-/// Anthropic gates the `context-1m-2025-08-07` beta on this; OAuth subscribers
-/// without 1M entitlement get a 400 if the beta is sent unconditionally.
+/// Check if a model has 1M extended context enabled.
+///
+/// Claude Code currently keys this off an explicit `[1m]` marker. We keep that
+/// marker and add a conservative forward-looking rule for Sonnet/Opus 4.6+.
+/// Anthropic gates the `context-1m-2025-08-07` beta on this; older models
+/// without 1M entitlement can reject the beta if it is sent unconditionally.
 /// Disabled entirely when `CLAUDE_CODE_DISABLE_1M_CONTEXT` / `KOU_CC_DISABLE_1M_CONTEXT` is truthy.
 fn has_1m_context(model_lower: &str) -> bool {
-    if read_env_bool(&["CLAUDE_CODE_DISABLE_1M_CONTEXT", "KOU_CC_DISABLE_1M_CONTEXT"]) {
+    if read_env_bool(&[
+        "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+        "KOU_CC_DISABLE_1M_CONTEXT",
+    ]) {
         return false;
     }
     model_lower.contains("[1m]")
+        || model_family_at_least(model_lower, "sonnet", 4, 6)
+        || model_family_at_least(model_lower, "opus", 4, 6)
+}
+
+fn model_family_at_least(model_lower: &str, family: &str, min_major: u32, min_minor: u32) -> bool {
+    let tokens: Vec<&str> = model_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if *token != family {
+            continue;
+        }
+
+        if version_at_least(
+            tokens
+                .get(idx + 1)
+                .and_then(|token| parse_version_token(token)),
+            tokens
+                .get(idx + 2)
+                .and_then(|token| parse_version_token(token)),
+            min_major,
+            min_minor,
+        ) {
+            return true;
+        }
+
+        if idx >= 2
+            && version_at_least(
+                parse_version_token(tokens[idx - 2]),
+                parse_version_token(tokens[idx - 1]),
+                min_major,
+                min_minor,
+            )
+        {
+            return true;
+        }
+
+        if idx >= 1
+            && (idx < 2 || parse_version_token(tokens[idx - 2]).is_none())
+            && version_at_least(
+                parse_version_token(tokens[idx - 1]),
+                None,
+                min_major,
+                min_minor,
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn version_at_least(
+    major: Option<u32>,
+    minor: Option<u32>,
+    min_major: u32,
+    min_minor: u32,
+) -> bool {
+    let Some(major) = major else {
+        return false;
+    };
+    major > min_major || major == min_major && minor.unwrap_or(0) >= min_minor
+}
+
+fn parse_version_token(token: &str) -> Option<u32> {
+    if token.len() <= 2 && token.chars().all(|c| c.is_ascii_digit()) {
+        token.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Simple getrandom using rand crate (already a dependency)
@@ -689,6 +733,8 @@ mod tests {
             workload: None,
             agent_sdk_version: None,
             client_app: None,
+            agent_id: None,
+            parent_agent_id: None,
             additional_protection: false,
             remote_container_id: None,
             remote_session_id: None,
@@ -813,18 +859,24 @@ mod tests {
         let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
         assert!(betas.contains("claude-code-20250219"));
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
-        assert!(betas.contains("redact-thinking-2026-02-12"));
         assert!(betas.contains("prompt-caching-scope-2026-01-05"));
         assert!(betas.contains("effort-2025-11-24"));
-        assert!(betas.contains("context-management-2025-06-27"));
-        // New 1P-only betas
-        assert!(betas.contains("fast-mode-2026-02-01"));
-        assert!(betas.contains("task-budgets-2026-03-13"));
-        assert!(betas.contains("advisor-tool-2026-03-01"));
-        // context-1m gates on `[1m]` suffix (canonical Claude Code behavior); plain Sonnet 4 has no opt-in.
         assert!(!betas.contains("context-1m-2025-08-07"));
-        assert!(betas.contains("afk-mode-2026-01-31"));
-        assert!(betas.contains("advanced-tool-use-2025-11-20"));
+        for removed_default in [
+            "redact-thinking-2026-02-12",
+            "context-management-2025-06-27",
+            "fast-mode-2026-02-01",
+            "task-budgets-2026-03-13",
+            "advisor-tool-2026-03-01",
+            "afk-mode-2026-01-31",
+            "structured-outputs-2025-12-15",
+            "advanced-tool-use-2025-11-20",
+        ] {
+            assert!(
+                !betas.contains(removed_default),
+                "default beta set should not include {removed_default}: {betas}"
+            );
+        }
         // 1P should NOT have 3P tool-search beta
         assert!(!betas.contains("tool-search-tool-2025-10-19"));
     }
@@ -842,9 +894,8 @@ mod tests {
         assert!(betas.contains("effort-2025-11-24"));
         // Haiku is not Claude 4+, no context management
         assert!(!betas.contains("context-management-2025-06-27"));
-        // But should have other 1P betas
         assert!(betas.contains("prompt-caching-scope-2026-01-05"));
-        assert!(betas.contains("fast-mode-2026-02-01"));
+        assert!(!betas.contains("fast-mode-2026-02-01"));
         // Haiku (claude-3) should NOT have context-1m (not Claude 4+)
         assert!(!betas.contains("context-1m-2025-08-07"));
     }
@@ -873,7 +924,7 @@ mod tests {
         assert!(betas.contains("claude-code-20250219"));
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(betas.contains("effort-2025-11-24"));
-        assert!(betas.contains("context-management-2025-06-27"));
+        assert!(!betas.contains("context-management-2025-06-27"));
         // 3P should NOT have 1P-only betas
         assert!(!betas.contains("prompt-caching-scope-2026-01-05"));
         assert!(!betas.contains("fast-mode-2026-02-01"));
@@ -889,10 +940,10 @@ mod tests {
     #[test]
     fn test_beta_headers_structured_outputs() {
         let fp = test_fingerprint();
-        // Claude 4.5+ should get structured-outputs on 1P
+        // The router does not synthesize structured-outputs unless the client
+        // supplied that beta itself.
         let betas = fp.beta_headers("claude-sonnet-4-5-20250514", ProviderKind::FirstParty, None);
-        assert!(betas.contains("structured-outputs-2025-12-15"));
-        // Claude 4.0 should NOT
+        assert!(!betas.contains("structured-outputs-2025-12-15"));
         let betas = fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
         assert!(!betas.contains("structured-outputs-2025-12-15"));
     }
@@ -1021,7 +1072,8 @@ mod tests {
     #[test]
     fn test_generate_headers() {
         let fp = test_fingerprint();
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let find = |name: &str| -> Option<String> {
             headers
@@ -1038,6 +1090,7 @@ mod tests {
             find("x-claude-code-session-id").unwrap(),
             "test-session-id-1234"
         );
+        assert_eq!(find("anthropic-version").as_deref(), Some("2023-06-01"));
         assert!(find("x-client-request-id").is_some());
         let betas = find("anthropic-beta").unwrap();
         assert!(betas.contains("claude-code-20250219"));
@@ -1072,7 +1125,8 @@ mod tests {
     fn test_generate_headers_with_workload() {
         let mut fp = test_fingerprint();
         fp.workload = Some("cron-task".to_string());
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let ua = headers
             .iter()
@@ -1092,7 +1146,8 @@ mod tests {
         fp.agent_sdk_version = Some("0.1.17".to_string());
         fp.client_app = Some("my-app".to_string());
         fp.workload = Some("cron".to_string());
-        let headers = fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
 
         let ua = headers
             .iter()
@@ -1119,6 +1174,25 @@ mod tests {
         let wl_pos = ua.find("workload").unwrap();
         assert!(sdk_pos < app_pos, "agent-sdk should come before client-app");
         assert!(app_pos < wl_pos, "client-app should come before workload");
+    }
+
+    #[test]
+    fn test_generate_headers_with_agent_ids() {
+        let mut fp = test_fingerprint();
+        fp.agent_id = Some("agent-123".to_string());
+        fp.parent_agent_id = Some("parent-456".to_string());
+        let headers =
+            fp.generate_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, None);
+
+        let find = |name: &str| -> Option<&str> {
+            headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(find("x-claude-code-agent-id"), Some("agent-123"));
+        assert_eq!(find("x-claude-code-parent-agent-id"), Some("parent-456"));
     }
 
     #[test]
@@ -1178,19 +1252,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_claude45_or_newer() {
-        assert!(is_claude45_or_newer("claude-sonnet-4-5-20250514"));
-        assert!(is_claude45_or_newer("claude-sonnet-4-6-20250514"));
-        assert!(is_claude45_or_newer("claude-opus-4-1-20250514"));
-        assert!(is_claude45_or_newer("claude-opus-4-5-20250514"));
-        assert!(is_claude45_or_newer("claude-haiku-4-5-20250514"));
-        assert!(is_claude45_or_newer("claude-5-sonnet"));
-        assert!(!is_claude45_or_newer("claude-sonnet-4-20250514"));
-        assert!(!is_claude45_or_newer("claude-opus-4-20250514"));
-        assert!(!is_claude45_or_newer("claude-3-5-sonnet-20241022"));
-    }
-
-    #[test]
     fn test_is_claude4_or_newer_haiku4() {
         assert!(is_claude4_or_newer("claude-haiku-4-5-20250514"));
         assert!(is_claude4_or_newer("haiku-4-latest"));
@@ -1218,8 +1279,11 @@ mod tests {
             account_uuid: Some("x".into()),
             is_oauth_subscriber: true,
         };
-        let betas =
-            fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::Other, Some(&oauth));
+        let betas = fp.beta_headers(
+            "claude-sonnet-4-20250514",
+            ProviderKind::Other,
+            Some(&oauth),
+        );
         assert!(!betas.contains("oauth-2025-04-20"));
     }
 
@@ -1230,8 +1294,11 @@ mod tests {
             account_uuid: Some("abc".into()),
             is_oauth_subscriber: true,
         };
-        let betas =
-            fp.beta_headers("claude-sonnet-4-20250514", ProviderKind::FirstParty, Some(&oauth));
+        let betas = fp.beta_headers(
+            "claude-sonnet-4-20250514",
+            ProviderKind::FirstParty,
+            Some(&oauth),
+        );
         assert!(betas.contains("oauth-2025-04-20"), "betas: {betas}");
     }
 
@@ -1242,8 +1309,11 @@ mod tests {
             account_uuid: None,
             is_oauth_subscriber: true,
         };
-        let betas =
-            fp.beta_headers("claude-3-5-haiku-20241022", ProviderKind::FirstParty, Some(&oauth));
+        let betas = fp.beta_headers(
+            "claude-3-5-haiku-20241022",
+            ProviderKind::FirstParty,
+            Some(&oauth),
+        );
         // Haiku не получает claude-code
         assert!(!betas.contains("claude-code-20250219"));
         // Но OAuth-beta включена
@@ -1359,21 +1429,35 @@ mod tests {
     }
 
     #[test]
-    fn test_has_1m_context_requires_explicit_suffix() {
-        // canonical Claude Code: only the `[1m]` suffix opts a model into 1M context
+    fn test_has_1m_context_detects_explicit_suffix_and_advanced_models() {
         assert!(!has_1m_context("claude-sonnet-4-5-20250929"));
         assert!(!has_1m_context("claude-opus-4-5"));
+        assert!(!has_1m_context("claude-3-5-sonnet-20241022"));
         assert!(has_1m_context("claude-sonnet-4-5-20250929[1m]"));
-        assert!(has_1m_context("claude-opus-4-6[1m]"));
+        assert!(has_1m_context("claude-sonnet-4-6-20250929"));
+        assert!(has_1m_context("claude-sonnet-4.6-20250929"));
+        assert!(has_1m_context("sonnet-4-7-latest"));
+        assert!(has_1m_context("claude-opus-4-6"));
+        assert!(has_1m_context("opus-5-latest"));
+        assert!(has_1m_context("claude-5-sonnet"));
+        assert!(!has_1m_context("claude-5-haiku"));
     }
 
     #[test]
-    fn test_beta_headers_context_1m_only_with_suffix() {
+    fn test_beta_headers_context_1m_with_suffix_or_advanced_model() {
         let fp = test_fingerprint();
         let plain = fp.beta_headers("claude-sonnet-4-5-20250929", ProviderKind::FirstParty, None);
         assert!(!plain.contains("context-1m-2025-08-07"));
-        let opt_in = fp.beta_headers("claude-sonnet-4-5-20250929[1m]", ProviderKind::FirstParty, None);
+        let opt_in = fp.beta_headers(
+            "claude-sonnet-4-5-20250929[1m]",
+            ProviderKind::FirstParty,
+            None,
+        );
         assert!(opt_in.contains("context-1m-2025-08-07"));
+        let advanced =
+            fp.beta_headers("claude-sonnet-4-6-20250929", ProviderKind::FirstParty, None);
+        assert!(advanced.contains("context-1m-2025-08-07"));
+        let third_party = fp.beta_headers("claude-sonnet-4-6-20250929", ProviderKind::Other, None);
+        assert!(!third_party.contains("context-1m-2025-08-07"));
     }
-
 }

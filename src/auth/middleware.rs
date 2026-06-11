@@ -1,4 +1,7 @@
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{
+    extract::FromRequestParts,
+    http::{HeaderMap, request::Parts},
+};
 
 use crate::{
     error::{AppError, AppResult},
@@ -17,11 +20,17 @@ pub struct ProxyAuth(pub AuthContext);
 /// Returns `AuthContext::Anonymous` when auth is not required.
 pub struct ManagementAuth(pub AuthContext);
 
+/// Best-effort identity for proxy routes: resolves an API key when one is
+/// presented but never rejects the request. Proxy endpoints stay open by
+/// design (see `test_proxy_blocked_without_key`); this only attributes
+/// request-log entries to a key.
+pub struct ProxyIdentity(pub AuthContext);
+
 fn unauthorized(msg: &str) -> AppError {
     AppError::BadRequest(format!("unauthorized: {msg}"))
 }
 
-async fn is_auth_required(state: &AppState) -> bool {
+pub async fn is_auth_required(state: &AppState) -> bool {
     state
         .repository
         .get_setting_bool("require_auth")
@@ -52,8 +61,8 @@ fn extract_api_key_header(parts: &Parts) -> Option<String> {
         .map(String::from)
 }
 
-fn extract_jwt_cookie(parts: &Parts) -> Option<String> {
-    let cookies = parts.headers.get("cookie")?.to_str().ok()?;
+fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get("cookie")?.to_str().ok()?;
     for cookie in cookies.split(';') {
         let cookie = cookie.trim();
         if let Some(value) = cookie.strip_prefix("kou_auth=") {
@@ -61,6 +70,18 @@ fn extract_jwt_cookie(parts: &Parts) -> Option<String> {
         }
     }
     None
+}
+
+/// True when the request carries a valid admin JWT cookie.
+/// Used by the web UI gate: without it the SPA itself is not served.
+pub async fn has_valid_admin_cookie(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = extract_jwt_cookie(headers) else {
+        return false;
+    };
+    let Some(secret) = get_jwt_secret(state).await else {
+        return false;
+    };
+    verify_token(&secret, &token).is_ok()
 }
 
 async fn validate_api_key(state: &AppState, key: &str) -> AppResult<AuthContext> {
@@ -99,6 +120,22 @@ impl FromRequestParts<AppState> for ProxyAuth {
     }
 }
 
+impl FromRequestParts<AppState> for ProxyIdentity {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(token) = extract_bearer_token(parts).or_else(|| extract_api_key_header(parts))
+            && let Ok(ctx) = validate_api_key(state, &token).await
+        {
+            return Ok(Self(ctx));
+        }
+        Ok(Self(AuthContext::Anonymous))
+    }
+}
+
 impl FromRequestParts<AppState> for ManagementAuth {
     type Rejection = AppError;
 
@@ -111,7 +148,7 @@ impl FromRequestParts<AppState> for ManagementAuth {
         }
 
         // Try JWT cookie first.
-        if let Some(token) = extract_jwt_cookie(parts) {
+        if let Some(token) = extract_jwt_cookie(&parts.headers) {
             if let Some(secret) = get_jwt_secret(state).await {
                 if let Ok(claims) = verify_token(&secret, &token) {
                     return Ok(Self(AuthContext::Admin {

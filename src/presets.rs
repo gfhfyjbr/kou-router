@@ -495,12 +495,8 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             "bearer",
             Some("Bearer"),
             &[
-                ("Openai-Beta", "responses=experimental"),
-                ("Version", "0.124.0"),
-                (
-                    "User-Agent",
-                    "codex_cli_rs/0.124.0 (Mac OS; arm64) ghostty/1.3.1",
-                ),
+                ("OpenAI-Beta", "responses=experimental"),
+                ("originator", "codex_cli_rs"),
             ],
             &[(
                 "responses",
@@ -508,7 +504,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             )],
             &[],
             &["responses"],
-            Some("codex/gpt-5.3-codex"),
+            Some("codex/gpt-5.5"),
             "Codex OAuth preset for managed ChatGPT-backed accounts using the native Codex responses endpoint and OAuth refresh flow.",
         ),
         preset(

@@ -25,6 +25,21 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
 }
 
+impl AppError {
+    /// HTTP status this error maps to (mirrors the IntoResponse impl).
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::ClassifiedUpstream { status, .. } => *status,
+            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            AppError::Database(_) | AppError::Http(_) | AppError::Json(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
@@ -221,7 +236,11 @@ fn extract_upstream_error_text(body: &str) -> Option<String> {
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .or_else(|| {
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                })
                 .or_else(|| {
                     v.get("message")
                         .and_then(|m| m.as_str())
