@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1385" height="289" viewBox="0 0 1385 289" role="img" aria-label="Kou Router switchyard hero">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0c1116"/>
+      <stop offset="0.45" stop-color="#0b0f14"/>
+      <stop offset="1" stop-color="#080b0f"/>
+    </linearGradient>
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="55%">
+      <stop offset="0" stop-color="#ff5938" stop-opacity=".2"/>
+      <stop offset=".42" stop-color="#1bd8bd" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="rightFade" cx="75%" cy="48%" r="70%">
+      <stop offset="0" stop-color="#152029" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#020305" stop-opacity=".72"/>
+    </radialGradient>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="hotGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.95  0 0.38 0 0 0.18  0 0 0.2 0 0.08  0 0 0 .85 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="tealGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.08  0 1 0 0 0.85  0 0 1 0 0.74  0 0 0 .82 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="grid" width="46" height="46" patternUnits="userSpaceOnUse">
+      <path d="M46 0H0v46" fill="none" stroke="#26313d" stroke-width=".6" opacity=".16"/>
+      <circle cx="46" cy="46" r="1.2" fill="#566575" opacity=".22"/>
+    </pattern>
+    <style>
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;letter-spacing:.18em}
+      .label{fill:#9aa4ad;font-size:13px;opacity:.56}
+      .small{fill:#7f8994;font-size:12px;opacity:.72}
+      .title{fill:#e8ecef;font-size:17px;font-weight:700;letter-spacing:.16em}
+      .dim{fill:#8b939c;font-size:12px;opacity:.72}
+      .wire{fill:none;stroke-linecap:round;stroke-linejoin:round}
+    </style>
+  </defs>
+
+  <rect width="1385" height="289" fill="url(#bg)"/>
+  <rect width="1385" height="289" fill="url(#grid)" opacity=".42"/>
+  <rect width="1385" height="289" fill="url(#rightFade)"/>
+  <rect x="430" y="-55" width="350" height="350" fill="url(#coreGlow)" opacity=".9"/>
+
+  <g class="mono">
+    <text x="36" y="30" class="label">CLIENTS &#20837;&#21475;</text>
+
+    <g opacity=".92">
+      <circle cx="36" cy="78" r="5" fill="none" stroke="#7e8b97" stroke-width="2"/>
+      <text x="55" y="66" class="small">/v1/messages</text>
+      <path class="wire" d="M41 78 C150 79 245 99 334 118 S503 145 545 145" stroke="#4b5663" stroke-width="2.2" opacity=".72"/>
+      <circle cx="154" cy="85" r="3.1" fill="#9aa2aa" opacity=".74"/>
+      <circle cx="192" cy="91" r="3.1" fill="#9aa2aa" opacity=".6"/>
+    </g>
+
+    <g opacity=".95">
+      <circle cx="36" cy="149" r="5" fill="none" stroke="#7e8b97" stroke-width="2"/>
+      <text x="55" y="137" class="small">/v1/chat/completions</text>
+      <path class="wire" d="M41 149 H186 C302 149 407 146 545 145" stroke="#4b5663" stroke-width="2.2" opacity=".72"/>
+      <circle cx="154" cy="149" r="3.1" fill="#9aa2aa" opacity=".72"/>
+    </g>
+
+    <g opacity=".92">
+      <circle cx="36" cy="221" r="5" fill="none" stroke="#7e8b97" stroke-width="2"/>
+      <text x="55" y="209" class="small">/v1/responses</text>
+      <path class="wire" d="M41 221 C146 218 236 196 330 176 S500 146 545 145" stroke="#4b5663" stroke-width="2.2" opacity=".72"/>
+      <circle cx="192" cy="206" r="3.1" fill="#9aa2aa" opacity=".72"/>
+    </g>
+  </g>
+
+  <g transform="translate(602 145)">
+    <circle r="83" fill="none" stroke="#1b252e" stroke-width="1.2" stroke-dasharray="2 9" opacity=".9"/>
+    <circle r="73" fill="#0f141a" stroke="#28313a" stroke-width="1.4"/>
+    <circle r="62" fill="none" stroke="#ff5b39" stroke-width="1.2" opacity=".22"/>
+    <g transform="rotate(-4)" filter="url(#hotGlow)">
+      <rect x="-39" y="-39" width="78" height="78" rx="17" fill="#ff4f31"/>
+      <rect x="-39" y="-39" width="78" height="78" rx="17" fill="none" stroke="#ff866d" stroke-opacity=".34"/>
+      <text x="0" y="16" text-anchor="middle" font-size="42" font-weight="800" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,sans-serif" fill="#fff">&#x5149;</text>
+    </g>
+    <text x="0" y="79" text-anchor="middle" class="mono" fill="#6f7a86" font-size="11" letter-spacing=".33em">KOU CORE</text>
+  </g>
+
+  <g>
+    <path class="wire" d="M668 145 C780 139 855 88 1017 75" stroke="#ff7856" stroke-width="2.5" opacity=".92" filter="url(#hotGlow)"/>
+    <path class="wire" d="M668 145 H1018" stroke="#27d7c0" stroke-width="2.4" opacity=".93" filter="url(#tealGlow)"/>
+    <path class="wire" d="M668 145 C790 153 858 213 1045 225" stroke="#38424f" stroke-width="1.6" stroke-dasharray="2 10" opacity=".72"/>
+    <circle cx="728" cy="145" r="4" fill="#e97b62"/>
+    <circle cx="740" cy="145" r="4" fill="#e97b62"/>
+    <circle cx="752" cy="145" r="4" fill="#e97b62"/>
+    <circle cx="764" cy="145" r="4" fill="#e97b62"/>
+    <circle cx="726" cy="153" r="3.7" fill="#2fd3be"/>
+    <circle cx="739" cy="153" r="3.7" fill="#2fd3be"/>
+    <circle cx="753" cy="153" r="3.7" fill="#2fd3be"/>
+  </g>
+
+  <g class="mono">
+    <g transform="translate(1075 73)">
+      <circle r="37" fill="#0d1117" stroke="#ee7455" stroke-width="2.2"/>
+      <circle r="44" fill="none" stroke="#ee7455" stroke-width="1.6" opacity=".42"/>
+      <circle cx="26" cy="-30" r="5" fill="#37d2a1" filter="url(#softGlow)"/>
+      <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CC</text>
+    </g>
+    <text x="1129" y="69" class="title">Claude Code</text>
+    <text x="1129" y="91" class="dim">2 ACCOUNTS</text>
+
+    <g transform="translate(1075 149)">
+      <circle r="37" fill="#0d1117" stroke="#1bd4bf" stroke-width="2.2"/>
+      <circle r="44" fill="none" stroke="#1bd4bf" stroke-width="1.5" opacity=".4"/>
+      <circle cx="26" cy="-30" r="5" fill="#ffbd54" filter="url(#softGlow)"/>
+      <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CO</text>
+    </g>
+    <text x="1129" y="145" class="title">Codex</text>
+    <text x="1129" y="167" class="dim">2 ACCOUNTS</text>
+
+    <g transform="translate(1075 225)" opacity=".88">
+      <circle r="33" fill="#0b0f14" stroke="#7a8795" stroke-width="1.7" stroke-dasharray="5 7"/>
+      <text x="0" y="8" text-anchor="middle" fill="#e7ecef" font-size="20" font-weight="700">+</text>
+    </g>
+    <text x="1129" y="230" class="dim">ADD LINE &#183; &#26032;&#36335;&#32218;</text>
+  </g>
+
+  <rect width="1385" height="289" fill="none" stroke="#151d24" stroke-width="1"/>
+</svg>
