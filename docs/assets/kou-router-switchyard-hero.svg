@@ -91,46 +91,46 @@
       <rect x="-39" y="-39" width="78" height="78" rx="17" fill="none" stroke="#ff866d" stroke-opacity=".34"/>
       <text x="0" y="16" text-anchor="middle" font-size="42" font-weight="800" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,sans-serif" fill="#fff">&#x5149;</text>
     </g>
-    <text x="0" y="79" text-anchor="middle" class="mono" fill="#6f7a86" font-size="11" letter-spacing=".33em">KOU CORE</text>
+    <text x="0" y="99" text-anchor="middle" class="mono" fill="#6f7a86" font-size="11" letter-spacing=".33em">KOU CORE</text>
   </g>
 
   <g>
-    <path class="wire" d="M668 145 C780 139 855 88 1017 75" stroke="#ff7856" stroke-width="2.5" opacity=".92" filter="url(#hotGlow)"/>
-    <path class="wire" d="M668 145 H1018" stroke="#27d7c0" stroke-width="2.4" opacity=".93" filter="url(#tealGlow)"/>
-    <path class="wire" d="M668 145 C790 153 858 213 1045 225" stroke="#38424f" stroke-width="1.6" stroke-dasharray="2 10" opacity=".72"/>
-    <circle cx="728" cy="145" r="4" fill="#e97b62"/>
-    <circle cx="740" cy="145" r="4" fill="#e97b62"/>
-    <circle cx="752" cy="145" r="4" fill="#e97b62"/>
-    <circle cx="764" cy="145" r="4" fill="#e97b62"/>
-    <circle cx="726" cy="153" r="3.7" fill="#2fd3be"/>
-    <circle cx="739" cy="153" r="3.7" fill="#2fd3be"/>
-    <circle cx="753" cy="153" r="3.7" fill="#2fd3be"/>
+    <path class="wire" d="M670 139 C772 132 878 78 1031 55" stroke="#ff7856" stroke-width="2.6" opacity=".92" filter="url(#hotGlow)"/>
+    <path class="wire" d="M670 153 C780 153 900 152 1031 151" stroke="#27d7c0" stroke-width="2.8" opacity=".95" filter="url(#tealGlow)"/>
+    <path class="wire" d="M670 165 C790 177 912 222 1042 235" stroke="#38424f" stroke-width="1.6" stroke-dasharray="2 10" opacity=".7"/>
+    <circle cx="722" cy="144" r="3.7" fill="#e97b62"/>
+    <circle cx="735" cy="144" r="3.7" fill="#e97b62"/>
+    <circle cx="748" cy="144" r="3.7" fill="#e97b62"/>
+    <circle cx="761" cy="144" r="3.7" fill="#e97b62"/>
+    <circle cx="722" cy="157" r="3.5" fill="#2fd3be"/>
+    <circle cx="736" cy="157" r="3.5" fill="#2fd3be"/>
+    <circle cx="750" cy="157" r="3.5" fill="#2fd3be"/>
   </g>
 
   <g class="mono">
-    <g transform="translate(1075 73)">
+    <g transform="translate(1075 55)">
       <circle r="37" fill="#0d1117" stroke="#ee7455" stroke-width="2.2"/>
       <circle r="44" fill="none" stroke="#ee7455" stroke-width="1.6" opacity=".42"/>
       <circle cx="26" cy="-30" r="5" fill="#37d2a1" filter="url(#softGlow)"/>
       <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CC</text>
     </g>
-    <text x="1129" y="69" class="title">Claude Code</text>
-    <text x="1129" y="91" class="dim">2 ACCOUNTS</text>
+    <text x="1129" y="51" class="title">Claude Code</text>
+    <text x="1129" y="73" class="dim">2 ACCOUNTS</text>
 
-    <g transform="translate(1075 149)">
+    <g transform="translate(1075 151)">
       <circle r="37" fill="#0d1117" stroke="#1bd4bf" stroke-width="2.2"/>
       <circle r="44" fill="none" stroke="#1bd4bf" stroke-width="1.5" opacity=".4"/>
       <circle cx="26" cy="-30" r="5" fill="#ffbd54" filter="url(#softGlow)"/>
       <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CO</text>
     </g>
-    <text x="1129" y="145" class="title">Codex</text>
-    <text x="1129" y="167" class="dim">2 ACCOUNTS</text>
+    <text x="1129" y="147" class="title">Codex</text>
+    <text x="1129" y="169" class="dim">2 ACCOUNTS</text>
 
-    <g transform="translate(1075 225)" opacity=".88">
+    <g transform="translate(1075 235)" opacity=".88">
       <circle r="33" fill="#0b0f14" stroke="#7a8795" stroke-width="1.7" stroke-dasharray="5 7"/>
       <text x="0" y="8" text-anchor="middle" fill="#e7ecef" font-size="20" font-weight="700">+</text>
     </g>
-    <text x="1129" y="230" class="dim">ADD LINE &#183; &#26032;&#36335;&#32218;</text>
+    <text x="1129" y="240" class="dim">ADD LINE &#183; &#26032;&#36335;&#32218;</text>
   </g>
 
   <rect width="1385" height="289" fill="none" stroke="#151d24" stroke-width="1"/>
