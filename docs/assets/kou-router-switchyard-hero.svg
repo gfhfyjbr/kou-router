@@ -14,6 +14,21 @@
       <stop offset="0" stop-color="#152029" stop-opacity=".18"/>
       <stop offset="1" stop-color="#020305" stop-opacity=".72"/>
     </radialGradient>
+    <linearGradient id="hotLine" x1="670" y1="139" x2="1146" y2="55" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff7856" stop-opacity=".08"/>
+      <stop offset=".28" stop-color="#ff7856" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#ff7856" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="tealLine" x1="670" y1="153" x2="1146" y2="151" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#27d7c0" stop-opacity=".08"/>
+      <stop offset=".3" stop-color="#27d7c0" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#27d7c0" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="ghostLine" x1="670" y1="165" x2="1151" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38424f" stop-opacity=".2"/>
+      <stop offset=".55" stop-color="#38424f" stop-opacity=".58"/>
+      <stop offset="1" stop-color="#38424f" stop-opacity=".78"/>
+    </linearGradient>
     <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
       <feGaussianBlur stdDeviation="4" result="blur"/>
       <feMerge>
@@ -47,6 +62,9 @@
       .small{fill:#7f8994;font-size:12px;opacity:.72}
       .title{fill:#e8ecef;font-size:17px;font-weight:700;letter-spacing:.16em}
       .dim{fill:#8b939c;font-size:12px;opacity:.72}
+      .providerTitle{fill:#e8ecef;font-size:16px;font-weight:700;letter-spacing:.09em}
+      .providerDim{fill:#8b939c;font-size:11px;opacity:.72;letter-spacing:.12em}
+      .providerAdd{fill:#8b939c;font-size:11px;opacity:.66;letter-spacing:.07em}
       .wire{fill:none;stroke-linecap:round;stroke-linejoin:round}
     </style>
   </defs>
@@ -95,42 +113,44 @@
   </g>
 
   <g>
-    <path class="wire" d="M670 139 C772 132 878 78 1031 55" stroke="#ff7856" stroke-width="2.6" opacity=".92" filter="url(#hotGlow)"/>
-    <path class="wire" d="M670 153 C780 153 900 152 1031 151" stroke="#27d7c0" stroke-width="2.8" opacity=".95" filter="url(#tealGlow)"/>
-    <path class="wire" d="M670 165 C790 177 912 222 1042 235" stroke="#38424f" stroke-width="1.6" stroke-dasharray="2 10" opacity=".7"/>
-    <circle cx="722" cy="144" r="3.7" fill="#e97b62"/>
-    <circle cx="735" cy="144" r="3.7" fill="#e97b62"/>
-    <circle cx="748" cy="144" r="3.7" fill="#e97b62"/>
-    <circle cx="761" cy="144" r="3.7" fill="#e97b62"/>
-    <circle cx="722" cy="157" r="3.5" fill="#2fd3be"/>
-    <circle cx="736" cy="157" r="3.5" fill="#2fd3be"/>
-    <circle cx="750" cy="157" r="3.5" fill="#2fd3be"/>
+    <path class="wire" d="M670 139 C792 132 948 79 1146 55" stroke="url(#hotLine)" stroke-width="8" opacity=".42" filter="url(#hotGlow)"/>
+    <path class="wire" d="M670 153 C812 153 984 152 1146 151" stroke="url(#tealLine)" stroke-width="8" opacity=".42" filter="url(#tealGlow)"/>
+    <path class="wire" d="M670 139 C792 132 948 79 1146 55" stroke="url(#hotLine)" stroke-width="2.7" opacity=".98"/>
+    <path class="wire" d="M670 153 C812 153 984 152 1146 151" stroke="url(#tealLine)" stroke-width="2.8" opacity=".98"/>
+    <path class="wire" d="M670 165 C810 179 982 222 1151 238" stroke="url(#ghostLine)" stroke-width="1.6" stroke-dasharray="2 10" opacity=".76"/>
+    <circle cx="722" cy="136" r="3.7" fill="#f07b61" filter="url(#softGlow)"/>
+    <circle cx="736" cy="134" r="3.7" fill="#f07b61" filter="url(#softGlow)"/>
+    <circle cx="750" cy="132" r="3.7" fill="#f07b61" filter="url(#softGlow)"/>
+    <circle cx="764" cy="129" r="3.7" fill="#f07b61" filter="url(#softGlow)"/>
+    <circle cx="722" cy="153" r="3.5" fill="#2fd3be" filter="url(#softGlow)"/>
+    <circle cx="736" cy="153" r="3.5" fill="#2fd3be" filter="url(#softGlow)"/>
+    <circle cx="750" cy="153" r="3.5" fill="#2fd3be" filter="url(#softGlow)"/>
   </g>
 
   <g class="mono">
-    <g transform="translate(1075 55)">
+    <g transform="translate(1190 55)">
       <circle r="37" fill="#0d1117" stroke="#ee7455" stroke-width="2.2"/>
       <circle r="44" fill="none" stroke="#ee7455" stroke-width="1.6" opacity=".42"/>
       <circle cx="26" cy="-30" r="5" fill="#37d2a1" filter="url(#softGlow)"/>
       <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CC</text>
     </g>
-    <text x="1129" y="51" class="title">Claude Code</text>
-    <text x="1129" y="73" class="dim">2 ACCOUNTS</text>
+    <text x="1245" y="51" class="providerTitle">Claude Code</text>
+    <text x="1245" y="73" class="providerDim">2 ACCOUNTS</text>
 
-    <g transform="translate(1075 151)">
+    <g transform="translate(1190 151)">
       <circle r="37" fill="#0d1117" stroke="#1bd4bf" stroke-width="2.2"/>
       <circle r="44" fill="none" stroke="#1bd4bf" stroke-width="1.5" opacity=".4"/>
       <circle cx="26" cy="-30" r="5" fill="#ffbd54" filter="url(#softGlow)"/>
       <text x="0" y="7" text-anchor="middle" class="title" font-size="18">CO</text>
     </g>
-    <text x="1129" y="147" class="title">Codex</text>
-    <text x="1129" y="169" class="dim">2 ACCOUNTS</text>
+    <text x="1245" y="147" class="providerTitle">Codex</text>
+    <text x="1245" y="169" class="providerDim">2 ACCOUNTS</text>
 
-    <g transform="translate(1075 235)" opacity=".88">
+    <g transform="translate(1190 238)" opacity=".88">
       <circle r="33" fill="#0b0f14" stroke="#7a8795" stroke-width="1.7" stroke-dasharray="5 7"/>
       <text x="0" y="8" text-anchor="middle" fill="#e7ecef" font-size="20" font-weight="700">+</text>
     </g>
-    <text x="1129" y="240" class="dim">ADD LINE &#183; &#26032;&#36335;&#32218;</text>
+    <text x="1245" y="243" class="providerAdd">ADD LINE &#183; &#26032;&#36335;&#32218;</text>
   </g>
 
   <rect width="1385" height="289" fill="none" stroke="#151d24" stroke-width="1"/>

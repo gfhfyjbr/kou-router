@@ -1,7 +1,7 @@
 # kou-router
 
 <p align="center">
-  <img src="docs/assets/kou-router-switchyard-hero.png" alt="Kou Router switchyard" width="100%">
+  <img src="docs/assets/kou-router-switchyard-hero.svg" alt="Kou Router switchyard" width="100%">
 </p>
 
 <p align="center">
