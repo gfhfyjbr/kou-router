@@ -6,8 +6,9 @@
 //!   ответ `{"models":[{"slug","visibility",…}]}`;
 //! - claude: `GET {base}/models?limit=1000` (Anthropic Models API),
 //!   ответ `{"data":[{"id",…}]}`.
+//! - custom OpenAI-compatible: `GET {account.base_url}/models`.
 //!
-//! Ошибки не фатальны: каталог просто остаётся без живого списка.
+//! Ошибки не фатальны: при сбое подмешивается preset-каталог.
 
 use std::time::Duration;
 
@@ -29,6 +30,26 @@ pub fn supports(provider: &str) -> bool {
     )
 }
 
+/// Preset slugs used when live fetch fails or no OAuth token is available.
+pub fn preset_slugs(provider: &str) -> &'static [&'static str] {
+    match provider.to_ascii_lowercase().as_str() {
+        "codex" => &[
+            "gpt-5.5",
+            "gpt-5-codex",
+            "gpt-5",
+            "o4-mini",
+            "codex-mini-latest",
+        ],
+        "claude-oauth" | "claude" | "anthropic-oauth" | "anthropic" => &[
+            "claude-opus-4-1",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-20250514",
+        ],
+        _ => &[],
+    }
+}
+
 pub async fn fetch(
     client: &reqwest::Client,
     provider: &ProviderConnection,
@@ -43,6 +64,49 @@ pub async fn fetch(
             "provider '{other}' has no native models route"
         ))),
     }
+}
+
+/// Best-effort OpenAI-compatible models list for a custom endpoint base URL.
+pub async fn fetch_openai_compatible(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> AppResult<Vec<String>> {
+    let base = base_url.trim_end_matches('/');
+    let url = if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    };
+
+    let mut request = client.get(&url);
+    if let Some(key) = api_key.filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| AppError::Upstream(format!("custom models fetch failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Upstream(format!(
+            "custom models fetch failed: status {}",
+            response.status()
+        )));
+    }
+
+    let parsed: OpenAiModels = response
+        .json()
+        .await
+        .map_err(|err| AppError::Upstream(format!("custom models response invalid: {err}")))?;
+
+    Ok(parsed
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|id| !id.is_empty())
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +166,17 @@ struct AnthropicModels {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicModel {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModels {
+    #[serde(default)]
+    data: Vec<OpenAiModelId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelId {
     id: String,
 }
 

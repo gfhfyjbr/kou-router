@@ -168,6 +168,15 @@ pub struct ProviderAccount {
     #[serde(default)]
     pub consecutive_use_count: i64,
     pub proxy_url: Option<String>,
+    /// Optional per-account upstream base URL (Custom API endpoints).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional per-account protocol format override (openai / openai-responses / claude).
+    #[serde(default)]
+    pub protocol_format: Option<String>,
+    /// Optional per-account endpoint capabilities.
+    #[serde(default)]
+    pub supported_endpoints: Option<Vec<String>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -193,6 +202,15 @@ pub struct NewProviderAccount {
     pub priority: Option<i64>,
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional per-account upstream base URL (Custom API endpoints).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional per-account protocol format override.
+    #[serde(default)]
+    pub protocol_format: Option<String>,
+    /// Optional per-account endpoint capabilities.
+    #[serde(default)]
+    pub supported_endpoints: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

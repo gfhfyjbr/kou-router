@@ -1,7 +1,14 @@
-import { useState } from 'react'
+import {
+  AppShell,
+  KouAmbience,
+  MainPane,
+  OverviewGrid,
+  SideStack,
+  ToastProvider,
+  Views,
+  ViewSection,
+} from '@kou/ui-kit'
 import { AppProvider, useApp } from './state/store'
-import { ToastProvider } from './components/ui/toast'
-import { Ambience } from './components/fx/Ambience'
 import { Rail } from './features/layout/Rail'
 import { TopBar } from './features/layout/TopBar'
 import { Switchyard } from './features/yard/Switchyard'
@@ -10,39 +17,37 @@ import { DeparturesBoard } from './features/board/DeparturesBoard'
 import { Signals } from './features/signals/Signals'
 import { IngressChips } from './features/ingress/IngressChips'
 import { ProvidersView } from './features/providers/ProvidersView'
-import { ImportModal } from './features/providers/ImportModal'
 import { KeysView } from './features/keys/KeysView'
 import { ModelsView } from './features/models/ModelsView'
 import { LogsView } from './features/logs/LogsView'
 import { SettingsView } from './features/settings/SettingsView'
 import { GateScreen } from './features/auth/AuthModal'
 
-function OverviewView({ onAddLine }: { onAddLine: () => void }) {
+function OverviewView() {
   return (
     <>
-      <Switchyard onAddLine={onAddLine} />
+      <Switchyard />
       <StatsStrip />
-      <div className="ov-grid">
+      <OverviewGrid>
         <DeparturesBoard />
-        <div className="ov-side">
+        <SideStack>
           <Signals />
           <IngressChips />
-        </div>
-      </div>
+        </SideStack>
+      </OverviewGrid>
     </>
   )
 }
 
 function Shell() {
-  const { view, navigate, mode, authed, authStatus } = useApp()
-  const [importOpen, setImportOpen] = useState(false)
+  const { view, mode, authed, authStatus } = useApp()
 
   // hard gate: nothing of the app renders until the admin password is entered
   // (Ambience still runs so the gate keeps the cursor, spotlight and embers)
   if (mode === 'live' && authStatus?.auth_required && !authed) {
     return (
       <>
-        <Ambience />
+        <KouAmbience />
         <GateScreen />
       </>
     )
@@ -50,26 +55,23 @@ function Shell() {
 
   return (
     <>
-      <Ambience />
-      <div className="app">
+      <KouAmbience />
+      <AppShell>
         <Rail />
-        <main>
+        <MainPane>
           <TopBar />
-          <div className={'views views-' + view}>
-            <section id={'view-' + view} className="view active" key={view}>
-              {view === 'overview' && (
-                <OverviewView onAddLine={() => { navigate('providers'); setImportOpen(true) }} />
-              )}
+          <Views logs={view === 'logs'}>
+            <ViewSection viewId={view} key={view}>
+              {view === 'overview' && <OverviewView />}
               {view === 'providers' && <ProvidersView />}
               {view === 'keys' && <KeysView />}
               {view === 'models' && <ModelsView />}
               {view === 'logs' && <LogsView />}
               {view === 'settings' && <SettingsView />}
-            </section>
-          </div>
-        </main>
-      </div>
-      <ImportModal open={importOpen} onClose={() => setImportOpen(false)} />
+            </ViewSection>
+          </Views>
+        </MainPane>
+      </AppShell>
     </>
   )
 }

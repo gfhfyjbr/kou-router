@@ -13,6 +13,7 @@ use crate::{
         default_supported_endpoints, supports_endpoint,
     },
     proxy,
+    response_cache::{NewResponseCacheEntry, ResponseCacheEntry},
 };
 
 #[derive(Clone)]
@@ -293,6 +294,114 @@ impl SqliteRepository {
         Ok(result.rows_affected())
     }
 
+    pub async fn find_response_cache_entry(
+        &self,
+        cache_key: &str,
+        namespace: &str,
+        request_body_hash: &str,
+    ) -> AppResult<Option<ResponseCacheEntry>> {
+        let now = Utc::now().to_rfc3339();
+        let row = sqlx::query(
+            r#"
+            SELECT cache_key, endpoint, upstream_endpoint, requested_model, resolved_model,
+                   provider_id, provider_account_id, namespace, request_body_hash, response_body,
+                   response_headers_json, status, is_stream, usage_json, expires_at, hit_count
+            FROM llm_response_cache
+            WHERE cache_key = ? AND namespace = ? AND request_body_hash = ? AND expires_at > ?
+            "#,
+        )
+        .bind(cache_key)
+        .bind(namespace)
+        .bind(request_body_hash)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE llm_response_cache
+            SET hit_count = hit_count + 1, last_hit_at = ?, updated_at = ?
+            WHERE cache_key = ?
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(cache_key)
+        .execute(&self.pool)
+        .await?;
+
+        map_response_cache_entry(row).map(Some)
+    }
+
+    pub async fn upsert_response_cache_entry(&self, input: NewResponseCacheEntry) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let response_headers_json = serde_json::to_string(&input.response_headers)?;
+        let usage_json = input
+            .usage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        sqlx::query(
+            r#"
+            INSERT INTO llm_response_cache (
+                cache_key, endpoint, upstream_endpoint, requested_model, resolved_model,
+                provider_id, provider_account_id, namespace, request_body_hash, response_body,
+                response_headers_json, status, is_stream, usage_json, expires_at, hit_count,
+                created_at, updated_at, last_hit_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                endpoint = excluded.endpoint,
+                upstream_endpoint = excluded.upstream_endpoint,
+                requested_model = excluded.requested_model,
+                resolved_model = excluded.resolved_model,
+                provider_id = excluded.provider_id,
+                provider_account_id = excluded.provider_account_id,
+                namespace = excluded.namespace,
+                request_body_hash = excluded.request_body_hash,
+                response_body = excluded.response_body,
+                response_headers_json = excluded.response_headers_json,
+                status = excluded.status,
+                is_stream = excluded.is_stream,
+                usage_json = excluded.usage_json,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&input.cache_key)
+        .bind(&input.endpoint)
+        .bind(&input.upstream_endpoint)
+        .bind(&input.requested_model)
+        .bind(&input.resolved_model)
+        .bind(&input.provider_id)
+        .bind(&input.provider_account_id)
+        .bind(&input.namespace)
+        .bind(&input.request_body_hash)
+        .bind(&input.response_body)
+        .bind(&response_headers_json)
+        .bind(input.status)
+        .bind(input.is_stream as i64)
+        .bind(&usage_json)
+        .bind(input.expires_at.to_rfc3339())
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn purge_expired_response_cache_entries(&self) -> AppResult<u64> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query("DELETE FROM llm_response_cache WHERE expires_at <= ?")
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_provider_connections(&self) -> AppResult<Vec<ProviderConnection>> {
         let rows = sqlx::query(
             r#"
@@ -331,6 +440,98 @@ impl SqliteRepository {
         .await?;
 
         row.map(map_provider).transpose()
+    }
+
+
+    pub async fn find_provider_connection_by_provider(
+        &self,
+        provider: &str,
+    ) -> AppResult<Option<ProviderConnection>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, provider, base_url, api_key, auth_type, auth_header, auth_prefix, extra_headers_json,
+                   endpoint_paths_json, stream_endpoint_paths_json, model_prefix, name, enabled, priority,
+                   default_model, supported_endpoints_json, rate_limit_protection, last_error, last_error_at,
+                   last_error_type, last_error_source, rate_limited_until, circuit_open_until, last_used_at,
+                   backoff_level, consecutive_use_count, test_status, created_at, updated_at, protocol_format
+            FROM provider_connections
+            WHERE provider = ?
+            ORDER BY priority ASC, created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_provider).transpose()
+    }
+
+
+    pub async fn list_provider_connections_by_provider(
+        &self,
+        provider: &str,
+    ) -> AppResult<Vec<ProviderConnection>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, provider, base_url, api_key, auth_type, auth_header, auth_prefix, extra_headers_json,
+                   endpoint_paths_json, stream_endpoint_paths_json, model_prefix, name, enabled, priority,
+                   default_model, supported_endpoints_json, rate_limit_protection, last_error, last_error_at,
+                   last_error_type, last_error_source, rate_limited_until, circuit_open_until, last_used_at,
+                   backoff_level, consecutive_use_count, test_status, created_at, updated_at, protocol_format
+            FROM provider_connections
+            WHERE provider = ?
+            ORDER BY priority ASC, created_at ASC
+            "#,
+        )
+        .bind(provider)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(map_provider).collect()
+    }
+
+
+    pub async fn update_provider_connection_base_url(
+        &self,
+        provider_id: &str,
+        base_url: &str,
+    ) -> AppResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE provider_connections SET base_url = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(base_url)
+        .bind(&now)
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_provider_connection_name(
+        &self,
+        provider_id: &str,
+        name: &str,
+    ) -> AppResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE provider_connections SET name = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(name)
+        .bind(&now)
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_provider_connection(&self, provider_id: &str) -> AppResult<bool> {
+        let result = sqlx::query("DELETE FROM provider_connections WHERE id = ?")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn create_provider_connection(
@@ -521,7 +722,8 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url,
+                   base_url, protocol_format, supported_endpoints_json, created_at, updated_at
             FROM provider_accounts
             WHERE provider_connection_id = ?
             ORDER BY priority ASC, created_at ASC
@@ -544,7 +746,8 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url,
+                   base_url, protocol_format, supported_endpoints_json, created_at, updated_at
             FROM provider_accounts
             WHERE provider_connection_id = ?
               AND enabled = 1
@@ -571,7 +774,8 @@ impl SqliteRepository {
             SELECT id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                    expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                    last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
+                   last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url,
+                   base_url, protocol_format, supported_endpoints_json, created_at, updated_at
             FROM provider_accounts
             WHERE id = ?
             "#,
@@ -598,11 +802,20 @@ impl SqliteRepository {
             )));
         }
 
+        let account_base_url = normalize_optional_url(input.base_url.as_deref())?;
+        let account_protocol_format = input
+            .protocol_format
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let account_supported_endpoints = input.supported_endpoints.clone().filter(|values| !values.is_empty());
+
         match input.auth_mode {
             ProviderAccountAuthMode::ApiKey => {
-                if !has_usable_secret(input.api_key.as_deref()) {
+                // Custom API accounts may be keyless (local/open gateways) when a base_url is set.
+                if !has_usable_secret(input.api_key.as_deref()) && account_base_url.is_none() {
                     return Err(AppError::BadRequest(
-                        "provider account auth_mode 'api_key' requires a non-empty api_key".into(),
+                        "provider account auth_mode 'api_key' requires a non-empty api_key (or base_url for custom endpoints)".into(),
                     ));
                 }
             }
@@ -630,14 +843,20 @@ impl SqliteRepository {
         let expires_at = input.expires_at.map(|value| value.to_rfc3339());
         let proxy_url = normalize_proxy_url(input.proxy_url.as_deref())?;
 
+        let supported_endpoints_json = account_supported_endpoints
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         sqlx::query(
             r#"
             INSERT INTO provider_accounts (
                 id, provider_connection_id, label, auth_mode, api_key, access_token, refresh_token,
                 expires_at, scopes_json, remote_account_id, remote_email, is_fedramp, enabled, priority,
                 last_used_at, rate_limited_until, circuit_open_until, last_error, last_error_type,
-                last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?)
+                last_refresh_at, refresh_error, backoff_level, consecutive_use_count, proxy_url,
+                base_url, protocol_format, supported_endpoints_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -655,6 +874,9 @@ impl SqliteRepository {
         .bind(if input.enabled { 1_i64 } else { 0_i64 })
         .bind(priority)
         .bind(&proxy_url)
+        .bind(&account_base_url)
+        .bind(&account_protocol_format)
+        .bind(&supported_endpoints_json)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&self.pool)
@@ -685,6 +907,9 @@ impl SqliteRepository {
             backoff_level: 0,
             consecutive_use_count: 0,
             proxy_url,
+            base_url: account_base_url,
+            protocol_format: account_protocol_format,
+            supported_endpoints: account_supported_endpoints,
             created_at: now,
             updated_at: now,
         })
@@ -1132,6 +1357,15 @@ impl SqliteRepository {
         })
     }
 
+
+    pub async fn delete_alias(&self, alias: &str) -> AppResult<bool> {
+        let result = sqlx::query("DELETE FROM model_aliases WHERE alias = ?")
+            .bind(alias)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn resolve_alias(&self, model: &str) -> AppResult<String> {
         let row = sqlx::query("SELECT target FROM model_aliases WHERE alias = ?")
             .bind(model)
@@ -1483,6 +1717,12 @@ fn map_provider_account(row: sqlx::sqlite::SqliteRow) -> AppResult<ProviderAccou
     let scopes_json: String = row.try_get("scopes_json")?;
     let scopes = serde_json::from_str(&scopes_json).unwrap_or_default();
 
+    let supported_endpoints_json: Option<String> = row.try_get("supported_endpoints_json").ok().flatten();
+    let supported_endpoints = supported_endpoints_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .filter(|values| !values.is_empty());
+
     Ok(ProviderAccount {
         id: row.try_get("id")?,
         provider_connection_id: row.try_get("provider_connection_id")?,
@@ -1508,6 +1748,9 @@ fn map_provider_account(row: sqlx::sqlite::SqliteRow) -> AppResult<ProviderAccou
         backoff_level: row.try_get("backoff_level")?,
         consecutive_use_count: row.try_get("consecutive_use_count")?,
         proxy_url: row.try_get("proxy_url")?,
+        base_url: row.try_get("base_url").ok().flatten(),
+        protocol_format: row.try_get("protocol_format").ok().flatten(),
+        supported_endpoints,
         created_at: parse_dt(row.try_get("created_at")?)?,
         updated_at: parse_dt(row.try_get("updated_at")?)?,
     })
@@ -1554,6 +1797,19 @@ fn has_usable_secret(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
 }
 
+
+fn normalize_optional_url(raw: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err(AppError::BadRequest(format!(
+            "base_url must be an http(s) URL, got '{value}'"
+        )));
+    }
+    Ok(Some(value.trim_end_matches('/').to_string()))
+}
+
 fn normalize_proxy_url(proxy_url: Option<&str>) -> AppResult<Option<String>> {
     match proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => {
@@ -1585,6 +1841,34 @@ fn map_request_log(row: sqlx::sqlite::SqliteRow) -> AppResult<RequestLog> {
         duration_ms: row.try_get("duration_ms")?,
         client_body: row.try_get("client_body")?,
         created_at: parse_dt(row.try_get("created_at")?)?,
+    })
+}
+
+fn map_response_cache_entry(row: sqlx::sqlite::SqliteRow) -> AppResult<ResponseCacheEntry> {
+    let response_headers_json: String = row.try_get("response_headers_json")?;
+    let response_headers = serde_json::from_str(&response_headers_json).unwrap_or_default();
+    let usage_json: Option<String> = row.try_get("usage_json")?;
+    let usage = usage_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?;
+    Ok(ResponseCacheEntry {
+        cache_key: row.try_get("cache_key")?,
+        endpoint: row.try_get("endpoint")?,
+        upstream_endpoint: row.try_get("upstream_endpoint")?,
+        requested_model: row.try_get("requested_model")?,
+        resolved_model: row.try_get("resolved_model")?,
+        provider_id: row.try_get("provider_id")?,
+        provider_account_id: row.try_get("provider_account_id")?,
+        namespace: row.try_get("namespace")?,
+        request_body_hash: row.try_get("request_body_hash")?,
+        response_body: row.try_get("response_body")?,
+        response_headers,
+        status: row.try_get("status")?,
+        is_stream: row.try_get::<i64, _>("is_stream")? != 0,
+        usage,
+        expires_at: parse_dt(row.try_get("expires_at")?)?,
+        hit_count: row.try_get("hit_count")?,
     })
 }
 
@@ -1673,7 +1957,10 @@ mod tests {
             NewOAuthSession, NewProviderAccount, NewProviderConnection, NewRequestDebugLog,
             NewResponseDebugLog, ProviderAccountAuthMode,
         },
+        response_cache::NewResponseCacheEntry,
     };
+    use chrono::{Duration, Utc};
+    use serde_json::json;
 
     fn test_provider_connection(provider: &str) -> NewProviderConnection {
         NewProviderConnection {
@@ -1758,6 +2045,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_cache_entry_round_trips_and_counts_hits() {
+        let pool = init_db("sqlite::memory:").await.unwrap();
+        let repository = SqliteRepository::new(pool);
+        let provider = repository
+            .create_provider_connection(test_provider_connection("openai"))
+            .await
+            .unwrap();
+
+        repository
+            .upsert_response_cache_entry(NewResponseCacheEntry {
+                cache_key: "cache-key".to_string(),
+                endpoint: "chat.completions".to_string(),
+                upstream_endpoint: "chat.completions".to_string(),
+                requested_model: "openai/gpt-4o-mini".to_string(),
+                resolved_model: "openai/gpt-4o-mini".to_string(),
+                provider_id: provider.id.clone(),
+                provider_account_id: None,
+                namespace: "api_key:test".to_string(),
+                request_body_hash: "body-hash".to_string(),
+                response_body: json!({"id": "chatcmpl_cache"}).to_string(),
+                response_headers: vec![("openai-model".to_string(), "gpt-4o-mini".to_string())],
+                status: 200,
+                is_stream: false,
+                usage: Some(crate::cost::UsageInfo {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    cache_read_tokens: Some(4),
+                    cache_creation_tokens: None,
+                    total_tokens: 12,
+                }),
+                expires_at: Utc::now() + Duration::minutes(5),
+            })
+            .await
+            .unwrap();
+
+        let first = repository
+            .find_response_cache_entry("cache-key", "api_key:test", "body-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.response_headers[0].0, "openai-model");
+        assert_eq!(first.usage.unwrap().cache_read_tokens, Some(4));
+
+        let second = repository
+            .find_response_cache_entry("cache-key", "api_key:test", "body-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.hit_count, 1);
+    }
+
+    #[tokio::test]
     async fn round_trip_provider_account_proxy_url() {
         let pool = init_db("sqlite::memory:").await.unwrap();
         let repository = SqliteRepository::new(pool);
@@ -1782,6 +2121,9 @@ mod tests {
                 enabled: true,
                 priority: Some(0),
                 proxy_url: Some("socks5h://1.2.3.4:1080".to_owned()),
+                base_url: None,
+                protocol_format: None,
+                supported_endpoints: None,
             })
             .await
             .unwrap();

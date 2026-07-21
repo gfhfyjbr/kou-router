@@ -14,7 +14,7 @@ export function seedDemo(): DemoSeed {
   return {
     providers: [
       {
-        id: 'pc-claude', provider: 'claude-code', name: 'Claude Code',
+        id: 'pc-claude', provider: 'claude-oauth', name: 'Claude Code',
         base_url: 'https://api.anthropic.com/v1', model_prefix: 'claude', priority: 10,
         enabled: true, default_model: 'claude-sonnet-4-5', rate_limited_until: null, last_error: null,
       },
@@ -23,6 +23,11 @@ export function seedDemo(): DemoSeed {
         base_url: 'https://chatgpt.com/backend-api/codex', model_prefix: 'codex', priority: 20,
         enabled: true, default_model: 'gpt-5-codex',
         rate_limited_until: new Date(now + 4 * 60e3 + 12e3).toISOString(), last_error: null,
+      },
+      {
+        id: 'pc-custom', provider: 'custom', name: 'Custom API',
+        base_url: '', model_prefix: 'custom', priority: 100,
+        enabled: true, default_model: null, rate_limited_until: null, last_error: null,
       },
     ],
     accounts: {
@@ -35,11 +40,14 @@ export function seedDemo(): DemoSeed {
         { id: 'acc-4', label: 'main', auth_mode: 'oauth', remote_email: 'kou@openai.dev', enabled: true, priority: 0, last_used_at: new Date(now - 12e3).toISOString(), expires_at: new Date(now + 30 * 60e3).toISOString(), rate_limited_until: new Date(now + 4 * 60e3).toISOString(), has_refresh_token: true, proxy_url: null },
         { id: 'acc-5', label: 'spare', auth_mode: 'oauth', remote_email: 'dev@openai.dev', enabled: true, priority: 1, last_used_at: new Date(now - 3 * 60e3).toISOString(), expires_at: new Date(now + 80 * 60e3).toISOString(), rate_limited_until: null, has_refresh_token: true, proxy_url: null },
       ],
+      'pc-custom': [
+        { id: 'acc-6', label: 'openrouter', auth_mode: 'api_key', remote_email: null, enabled: true, priority: 0, last_used_at: new Date(now - 90e3).toISOString(), expires_at: null, rate_limited_until: null, has_refresh_token: false, proxy_url: null, base_url: 'https://openrouter.ai/api/v1', protocol_format: 'openai', supported_endpoints: ['chat'] },
+      ],
     },
     models: [
       'claude-sonnet-4-5', 'claude-opus-4-1', 'claude-haiku-4-5',
       'gpt-5-codex', 'gpt-5', 'o4-mini', 'codex-mini-latest',
-    ].map(id => ({ id, owned_by: /claude/.test(id) ? 'claude-code' : 'codex' })),
+    ].map(id => ({ id, owned_by: /claude/.test(id) ? 'claude-oauth' : 'codex' })),
     aliases: [
       { alias: 'fast', target: 'claude-haiku-4-5' },
       { alias: 'smart', target: 'claude-opus-4-1' },

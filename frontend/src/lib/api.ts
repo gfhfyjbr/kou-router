@@ -23,7 +23,10 @@ export async function api<T = unknown>(path: string, opts: ApiOptions = {}): Pro
     let msg = `${res.status} ${res.statusText}`
     try {
       const j = await res.json()
-      msg = j.error || j.message || JSON.stringify(j)
+      if (typeof j.error === 'string') msg = j.error
+      else if (j.error?.message) msg = j.error.message
+      else if (j.message) msg = j.message
+      else msg = JSON.stringify(j)
     } catch {
       /* not json */
     }

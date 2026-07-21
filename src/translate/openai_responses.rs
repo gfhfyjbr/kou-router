@@ -33,6 +33,8 @@ pub fn openai_request_to_responses(model: &str, body: &Value, stream: bool) -> A
             "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "prompt_cache_key",
+            "prompt_cache_retention",
             "reasoning",
             "metadata",
             "store",
@@ -71,7 +73,15 @@ pub fn claude_request_to_responses(model: &str, body: &Value, stream: bool) -> A
     copy_if_present(
         &mut out,
         body,
-        &["temperature", "top_p", "tools", "tool_choice", "metadata"],
+        &[
+            "temperature",
+            "top_p",
+            "tools",
+            "tool_choice",
+            "metadata",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+        ],
     );
 
     if let Some(max_tokens) = body.get("max_tokens") {
@@ -284,7 +294,9 @@ mod tests {
                 {"role": "system", "content": "Be exact."},
                 {"role": "user", "content": "ping"}
             ],
-            "max_tokens": 10
+            "max_tokens": 10,
+            "prompt_cache_key": "shared-prefix",
+            "prompt_cache_retention": "24h"
         });
 
         let result = openai_request_to_responses("gpt-5.5", &body, false).unwrap();
@@ -294,6 +306,8 @@ mod tests {
         assert_eq!(result["input"][0]["role"], "user");
         assert_eq!(result["input"][0]["content"][0]["text"], "ping");
         assert_eq!(result["max_output_tokens"], 10);
+        assert_eq!(result["prompt_cache_key"], "shared-prefix");
+        assert_eq!(result["prompt_cache_retention"], "24h");
     }
 
     #[test]
@@ -301,7 +315,8 @@ mod tests {
         let body = json!({
             "system": [{"type": "text", "text": "Be exact."}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
-            "max_tokens": 10
+            "max_tokens": 10,
+            "prompt_cache_key": "claude-prefix"
         });
 
         let result = claude_request_to_responses("gpt-5.5", &body, false).unwrap();
@@ -310,6 +325,7 @@ mod tests {
         assert_eq!(result["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(result["input"][0]["content"][0]["text"], "ping");
         assert_eq!(result["max_output_tokens"], 10);
+        assert_eq!(result["prompt_cache_key"], "claude-prefix");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod presets;
 pub mod proxy;
 pub mod ratelimit;
 pub mod repository;
+pub mod response_cache;
 pub mod retry;
 pub mod routes;
 pub mod search;

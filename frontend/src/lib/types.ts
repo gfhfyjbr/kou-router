@@ -26,6 +26,9 @@ export interface Account {
   circuit_open_until?: string | null
   has_refresh_token?: boolean
   proxy_url?: string | null
+  base_url?: string | null
+  protocol_format?: string | null
+  supported_endpoints?: string[] | null
   last_error?: string | null
   last_error_type?: string | null
   updated_at?: string | null

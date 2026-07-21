@@ -24,9 +24,10 @@ use crate::{
         ProviderAccountAuthMode, RoutingProviderAccount, SettingsPayload,
     },
     oauth::{OAuthCompleteAuthorizationRequest, OAuthService, OAuthStartAuthorizationRequest},
-    presets::{ImportProviderPresetRequest, import_request_to_provider, provider_presets},
+    presets::{ImportProviderPresetRequest, ensure_builtin_provider_connections, import_request_to_provider, provider_presets},
     proxy::{self, ProxyClientCache},
     repository::SqliteRepository,
+    response_cache::ResponseCacheContext,
     service::{RoutedResult, RouterService},
     upstream::PassthroughHeaders,
 };
@@ -106,6 +107,9 @@ struct ProviderAccountResponse {
     backoff_level: i64,
     consecutive_use_count: i64,
     proxy_url: Option<String>,
+    base_url: Option<String>,
+    protocol_format: Option<String>,
+    supported_endpoints: Option<Vec<String>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -136,6 +140,9 @@ impl From<ProviderAccount> for ProviderAccountResponse {
             backoff_level: account.backoff_level,
             consecutive_use_count: account.consecutive_use_count,
             proxy_url: account.proxy_url,
+            base_url: account.base_url,
+            protocol_format: account.protocol_format,
+            supported_endpoints: account.supported_endpoints,
             created_at: account.created_at,
             updated_at: account.updated_at,
         }
@@ -254,6 +261,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/combos", get(list_combos).post(create_combo))
         .route("/api/models/alias", get(list_aliases).post(upsert_alias))
+        .route("/api/models/alias/{alias}", delete(delete_alias))
         .route("/api/settings", get(get_settings).post(put_settings))
         .route("/api/ratelimits", get(get_ratelimits))
         .route(
@@ -352,6 +360,7 @@ async fn chat_completions(
         EndpointKind::ChatCompletions,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -370,6 +379,7 @@ async fn completions(
         EndpointKind::Completions,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -388,6 +398,7 @@ async fn messages(
         EndpointKind::Messages,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -498,6 +509,7 @@ async fn responses(
         EndpointKind::Responses,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -517,6 +529,7 @@ async fn responses_with_suffix(
         EndpointKind::Responses,
         payload,
         Some(path),
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -535,6 +548,7 @@ async fn ollama_chat(
         EndpointKind::OllamaChat,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -553,6 +567,7 @@ async fn embeddings(
         EndpointKind::Embeddings,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -571,6 +586,7 @@ async fn image_generations(
         EndpointKind::ImagesGenerations,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -589,6 +605,7 @@ async fn music_generations(
         EndpointKind::MusicGenerations,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -607,6 +624,7 @@ async fn video_generations(
         EndpointKind::VideosGenerations,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -625,6 +643,7 @@ async fn moderations(
         EndpointKind::Moderations,
         payload,
         None,
+        &headers,
         Some(pt),
         auth.0,
     )
@@ -638,7 +657,16 @@ async fn rerank(
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Rerank, payload, None, Some(pt), auth.0).await
+    route_json(
+        state,
+        EndpointKind::Rerank,
+        payload,
+        None,
+        &headers,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn search(
@@ -648,7 +676,16 @@ async fn search(
     Json(payload): Json<Value>,
 ) -> AppResult<Response> {
     let pt = PassthroughHeaders::from_header_map(&headers);
-    route_json(state, EndpointKind::Search, payload, None, Some(pt), auth.0).await
+    route_json(
+        state,
+        EndpointKind::Search,
+        payload,
+        None,
+        &headers,
+        Some(pt),
+        auth.0,
+    )
+    .await
 }
 
 async fn audio_speech(
@@ -765,6 +802,7 @@ async fn route_json(
     endpoint: EndpointKind,
     payload: Value,
     suffix: Option<String>,
+    headers: &axum::http::HeaderMap,
     passthrough_headers: Option<PassthroughHeaders>,
     auth: AuthContext,
 ) -> AppResult<Response> {
@@ -793,6 +831,7 @@ async fn route_json(
         .unwrap_or_default()
         .to_string();
     let client_body = serde_json::to_string(&payload).ok();
+    let cache_context = ResponseCacheContext::from_headers(headers, &auth)?;
     let started = std::time::Instant::now();
     let new_log = |status: i64, error: Option<String>| NewRequestLog {
         id: request_id.clone(),
@@ -823,6 +862,7 @@ async fn route_json(
             suffix,
             passthrough_headers,
             request_id.clone(),
+            cache_context,
         )
         .await
     {
@@ -991,6 +1031,7 @@ async fn list_providers(
     State(state): State<AppState>,
     _auth: ManagementAuth,
 ) -> AppResult<Json<Vec<crate::models::ProviderConnection>>> {
+    ensure_builtin_provider_connections(&state.repository).await?;
     Ok(Json(state.repository.list_provider_connections().await?))
 }
 
@@ -1053,6 +1094,18 @@ async fn upsert_alias(
         .upsert_alias(&payload.alias, &payload.target)
         .await?;
     Ok(Json(json!(alias)))
+}
+
+async fn delete_alias(
+    State(state): State<AppState>,
+    _auth: ManagementAuth,
+    Path(alias): Path<String>,
+) -> AppResult<Json<Value>> {
+    let deleted = state.repository.delete_alias(&alias).await?;
+    if !deleted {
+        return Err(AppError::NotFound(format!("alias {alias}")));
+    }
+    Ok(Json(json!({ "ok": true, "alias": alias })))
 }
 
 async fn get_settings(

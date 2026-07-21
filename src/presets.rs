@@ -449,7 +449,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         ),
         preset(
             "claude-oauth",
-            "Claude OAuth",
+            "Claude Code",
             "https://api.anthropic.com/v1",
             "oauth",
             "bearer",
@@ -489,7 +489,7 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
         ),
         preset(
             "codex",
-            "Codex OAuth",
+            "Codex",
             "https://chatgpt.com/backend-api/codex",
             "oauth",
             "bearer",
@@ -530,6 +530,253 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             "GitHub Copilot scaffold из OmniRoute. OAuth и provider-specific response nuances ещё впереди.",
         ),
     ]
+}
+
+
+pub const BUILTIN_OAUTH_PRESET_IDS: &[&str] = &["codex", "claude-oauth"];
+
+
+fn host_from_base_url(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme.split('/').next().unwrap_or("").trim();
+    if host.is_empty() || host == "custom.local" {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn is_custom_shell_line(provider: &crate::models::ProviderConnection) -> bool {
+    if !provider.provider.eq_ignore_ascii_case("custom") {
+        return false;
+    }
+    let name = provider.name.as_deref().unwrap_or("").trim();
+    let base = provider.base_url.trim();
+    // Canonical shell created by ensure. Old leftover custom *lines* used hostnames
+    // and random model prefixes like `custom-cnw2`.
+    name.eq_ignore_ascii_case("Custom API")
+        || base.contains("custom.local")
+        || provider.model_prefix == "custom"
+}
+
+fn custom_shell_connection() -> NewProviderConnection {
+    NewProviderConnection {
+        provider: "custom".to_string(),
+        base_url: String::new(),
+        api_key: None,
+        auth_type: "apikey".to_string(),
+        auth_header: "bearer".to_string(),
+        auth_prefix: Some("Bearer".to_string()),
+        extra_headers: Default::default(),
+        endpoint_paths: Some(Default::default()),
+        stream_endpoint_paths: Some(Default::default()),
+        model_prefix: Some("custom".to_string()),
+        name: Some("Custom API".to_string()),
+        enabled: true,
+        priority: Some(100),
+        default_model: None,
+        // shell line: account-level endpoints decide capabilities
+        supported_endpoints: Some(vec![
+            "chat".to_string(),
+            "messages".to_string(),
+            "responses".to_string(),
+        ]),
+        rate_limit_protection: false,
+        protocol_format: None,
+    }
+}
+
+/// Ensure the always-on provider lines exist in the DB (Codex, Claude, Custom API).
+/// Also collapses leftover custom *provider lines* from the old flow into accounts
+/// under the single Custom API shell line.
+pub async fn ensure_builtin_provider_connections(
+    repository: &crate::repository::SqliteRepository,
+) -> AppResult<()> {
+    for preset_id in BUILTIN_OAUTH_PRESET_IDS {
+        if repository
+            .find_provider_connection_by_provider(preset_id)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        let create = import_request_to_provider(ImportProviderPresetRequest {
+            preset_id: preset_id.to_string(),
+            api_key: None,
+            model_prefix: None,
+            name: None,
+            enabled: None,
+            priority: None,
+            rate_limit_protection: None,
+        })?;
+        repository.create_provider_connection(create).await?;
+    }
+
+    ensure_single_custom_api_line(repository).await?;
+    normalize_builtin_line_names(repository).await?;
+    Ok(())
+}
+
+fn canonical_line_name(provider: &str, name: Option<&str>) -> Option<&'static str> {
+    let provider = provider.to_ascii_lowercase();
+    let name_l = name.unwrap_or("").to_ascii_lowercase();
+    if provider == "codex" || name_l == "codex oauth" || name_l == "codex" {
+        return Some("Codex");
+    }
+    if matches!(
+        provider.as_str(),
+        "claude-oauth" | "claude" | "anthropic-oauth" | "anthropic"
+    ) || name_l == "claude oauth"
+        || name_l == "claude code"
+    {
+        return Some("Claude Code");
+    }
+    if provider == "custom" || name_l == "custom api" {
+        return Some("Custom API");
+    }
+    None
+}
+
+async fn normalize_builtin_line_names(
+    repository: &crate::repository::SqliteRepository,
+) -> AppResult<()> {
+    let providers = repository.list_provider_connections().await?;
+    for provider in providers {
+        let Some(canonical) = canonical_line_name(&provider.provider, provider.name.as_deref())
+        else {
+            continue;
+        };
+        let current = provider.name.as_deref().unwrap_or("").trim();
+        if current != canonical {
+            repository
+                .update_provider_connection_name(&provider.id, canonical)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_single_custom_api_line(
+    repository: &crate::repository::SqliteRepository,
+) -> AppResult<()> {
+    let customs = repository
+        .list_provider_connections_by_provider("custom")
+        .await?;
+
+    let mut shell = if let Some(shell) = customs.iter().find(|p| is_custom_shell_line(p)).cloned() {
+        shell
+    } else {
+        repository
+            .create_provider_connection(custom_shell_connection())
+            .await?
+    };
+
+    // Never show a fake shell URL on the Custom API card.
+    if shell.base_url.contains("custom.local") || shell.base_url.trim().is_empty() {
+        if shell.base_url.contains("custom.local") {
+            repository
+                .update_provider_connection_base_url(&shell.id, "")
+                .await?;
+            shell.base_url.clear();
+        }
+    }
+
+    for orphan in customs.into_iter().filter(|p| p.id != shell.id) {
+        // Re-home connection-level endpoint config as an account under the shell.
+        let label = orphan
+            .name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| host_from_base_url(&orphan.base_url))
+            .unwrap_or_else(|| "custom endpoint".to_string());
+
+        let supported = if orphan.supported_endpoints.is_empty() {
+            None
+        } else {
+            Some(orphan.supported_endpoints.clone())
+        };
+
+        // Only migrate if this orphan looks like a usable endpoint (has base_url).
+        if !orphan.base_url.trim().is_empty()
+            && !orphan.base_url.contains("custom.local")
+        {
+            repository
+                .create_provider_account(crate::models::NewProviderAccount {
+                    provider_connection_id: shell.id.clone(),
+                    label: Some(label),
+                    auth_mode: crate::models::ProviderAccountAuthMode::ApiKey,
+                    api_key: orphan.api_key.clone(),
+                    access_token: None,
+                    refresh_token: None,
+                    expires_at: None,
+                    scopes: None,
+                    remote_account_id: None,
+                    remote_email: None,
+                    is_fedramp: false,
+                    enabled: orphan.enabled,
+                    priority: Some(orphan.priority),
+                    proxy_url: None,
+                    base_url: Some(orphan.base_url.clone()),
+                    protocol_format: orphan.protocol_format.clone(),
+                    supported_endpoints: supported,
+                })
+                .await?;
+        }
+
+        // Move any accounts that already lived under the orphan line.
+        let orphan_accounts = repository.list_provider_accounts(&orphan.id).await?;
+        for account in orphan_accounts {
+            repository
+                .create_provider_account(crate::models::NewProviderAccount {
+                    provider_connection_id: shell.id.clone(),
+                    label: account.label,
+                    auth_mode: account.auth_mode,
+                    api_key: account.api_key,
+                    access_token: account.access_token,
+                    refresh_token: account.refresh_token,
+                    expires_at: account.expires_at,
+                    scopes: Some(account.scopes),
+                    remote_account_id: account.remote_account_id,
+                    remote_email: account.remote_email,
+                    is_fedramp: account.is_fedramp,
+                    enabled: account.enabled,
+                    priority: Some(account.priority),
+                    proxy_url: account.proxy_url,
+                    base_url: account.base_url.or(Some(orphan.base_url.clone())),
+                    protocol_format: account.protocol_format.or(orphan.protocol_format.clone()),
+                    supported_endpoints: account
+                        .supported_endpoints
+                        .or_else(|| {
+                            if orphan.supported_endpoints.is_empty() {
+                                None
+                            } else {
+                                Some(orphan.supported_endpoints.clone())
+                            }
+                        }),
+                })
+                .await?;
+        }
+
+        repository.delete_provider_connection(&orphan.id).await?;
+    }
+
+    Ok(())
+}
+
+/// Map a Custom API standard id into protocol_format + supported_endpoints.
+pub fn custom_api_standard_config(standard: &str) -> AppResult<(Option<String>, Vec<String>)> {
+    match standard.trim().to_ascii_lowercase().as_str() {
+        "openai-responses" => Ok((Some("openai-responses".to_string()), vec!["responses".to_string()])),
+        "openai-completions" => Ok((Some("openai".to_string()), vec!["chat".to_string()])),
+        "anthropic-messages" => Ok((Some("claude".to_string()), vec!["messages".to_string()])),
+        other => Err(AppError::BadRequest(format!(
+            "unsupported custom api standard '{other}' (expected openai-responses, openai-completions, anthropic-messages)"
+        ))),
+    }
 }
 
 pub fn find_provider_preset(id: &str) -> Option<ProviderPreset> {
@@ -618,7 +865,7 @@ fn detect_preset_protocol(preset_id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_preset_protocol;
+    use super::{custom_api_standard_config, detect_preset_protocol};
 
     #[test]
     fn test_detect_preset_protocol_codex_responses() {
@@ -626,5 +873,25 @@ mod tests {
             detect_preset_protocol("codex"),
             Some("openai-responses".to_string())
         );
+    }
+
+    #[test]
+    fn test_custom_api_standard_config_maps_known_values() {
+        let (fmt, endpoints) = custom_api_standard_config("openai-responses").unwrap();
+        assert_eq!(fmt.as_deref(), Some("openai-responses"));
+        assert_eq!(endpoints, vec!["responses".to_string()]);
+
+        let (fmt, endpoints) = custom_api_standard_config("openai-completions").unwrap();
+        assert_eq!(fmt.as_deref(), Some("openai"));
+        assert_eq!(endpoints, vec!["chat".to_string()]);
+
+        let (fmt, endpoints) = custom_api_standard_config("anthropic-messages").unwrap();
+        assert_eq!(fmt.as_deref(), Some("claude"));
+        assert_eq!(endpoints, vec!["messages".to_string()]);
+    }
+
+    #[test]
+    fn test_custom_api_standard_config_rejects_unknown() {
+        assert!(custom_api_standard_config("soap").is_err());
     }
 }

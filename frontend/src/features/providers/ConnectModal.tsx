@@ -1,11 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
+import { KouConnectAccountModal, useToast } from '@kou/ui-kit'
 import { useApp } from '../../state/store'
-import { useToast } from '../../components/ui/toast'
 import { api } from '../../lib/api'
-import { Modal } from '../../components/ui/Modal'
-import { Button } from '../../components/ui/Button'
-import { Field, Input } from '../../components/ui/Field'
-import { Dropdown } from '../../components/ui/Dropdown'
 
 interface OAuthSession {
   state: string
@@ -106,52 +102,27 @@ export function ConnectModal({ pid, onClose }: { pid: string | null; onClose: ()
     }
   }
 
+  const close = () => { onClose(); reset() }
+
   return (
-    <Modal
+    <KouConnectAccountModal
       open={pid !== null}
-      onClose={() => { onClose(); reset() }}
-      title="CONNECT ACCOUNT" kana="口座接続"
-      footer={
-        <>
-          <Button onClick={() => { onClose(); reset() }}>CANCEL</Button>
-          <Button variant="primary" onClick={() => void go()}>
-            {authMode === 'oauth' ? (session ? 'COMPLETE' : 'START') : 'SAVE'}
-          </Button>
-        </>
-      }
-    >
-      <Field label="MODE">
-        <Dropdown
-          value={authMode}
-          onChange={v => setAuthMode(v as 'oauth' | 'api_key')}
-          options={[
-            { value: 'oauth', label: 'OAuth' },
-            { value: 'api_key', label: 'API key' },
-          ]}
-        />
-      </Field>
-      <Field label="LABEL">
-        <Input placeholder="main" value={label} onChange={e => setLabel(e.target.value)} />
-      </Field>
-      {authMode === 'oauth' ? (
-        <>
-          <Field label="REDIRECT URI">
-            <Input value={redirect ?? defRedirect} onChange={e => setRedirect(e.target.value)} />
-          </Field>
-          <Field label="PROXY FOR OAUTH (optional)">
-            <Input placeholder="socks5://…" value={proxy} onChange={e => setProxy(e.target.value)} />
-          </Field>
-          {session && (
-            <Field label="PASTE CODE (code or code#state)">
-              <Input placeholder="ac_…" value={code} onChange={e => setCode(e.target.value)} />
-            </Field>
-          )}
-        </>
-      ) : (
-        <Field label="API KEY">
-          <Input placeholder="sk-…" value={apiKey} onChange={e => setApiKey(e.target.value)} />
-        </Field>
-      )}
-    </Modal>
+      authMode={authMode}
+      label={label}
+      redirect={redirect}
+      defaultRedirect={defRedirect}
+      proxy={proxy}
+      code={code}
+      apiKey={apiKey}
+      sessionActive={session !== null}
+      onAuthModeChange={setAuthMode}
+      onLabelChange={setLabel}
+      onRedirectChange={setRedirect}
+      onProxyChange={setProxy}
+      onCodeChange={setCode}
+      onApiKeyChange={setApiKey}
+      onClose={close}
+      onSubmit={() => void go()}
+    />
   )
 }

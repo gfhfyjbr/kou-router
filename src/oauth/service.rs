@@ -195,6 +195,9 @@ impl OAuthService {
                     enabled: true,
                     priority: None,
                     proxy_url: session.proxy_url.clone(),
+                    base_url: None,
+                    protocol_format: None,
+                    supported_endpoints: None,
                 })
                 .await?
         };

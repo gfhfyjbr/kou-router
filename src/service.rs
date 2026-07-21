@@ -19,6 +19,10 @@ use crate::{
     proxy::ProxyClientCache,
     ratelimit::{RateLimitTracker, parse_rate_limit_headers},
     repository::SqliteRepository,
+    response_cache::{
+        NewResponseCacheEntry, ResponseCacheContext, build_identity, cacheable_response_headers,
+        evaluate_policy,
+    },
     retry::{RetryConfig, execute_with_retry},
     translate::{ProtocolFormat, TranslatorRegistry},
     upstream::{
@@ -137,6 +141,57 @@ fn persist_codex_stream_buffer_debug_log(
     });
 }
 
+fn spawn_stream_response_cache_write(
+    repository: Arc<SqliteRepository>,
+    mut entry: NewResponseCacheEntry,
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    tokio::spawn(async move {
+        let mut last_len = None;
+        let mut stable_polls = 0_u8;
+        let mut transcript = String::new();
+
+        for _ in 0..240 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let snapshot = match buffer.lock() {
+                Ok(buf) if !buf.is_empty() => String::from_utf8_lossy(&buf).to_string(),
+                Ok(_) => continue,
+                Err(_) => return,
+            };
+            if last_len == Some(snapshot.len()) {
+                stable_polls += 1;
+            } else {
+                stable_polls = 0;
+                last_len = Some(snapshot.len());
+            }
+            transcript = snapshot;
+            if stable_polls >= 2 {
+                break;
+            }
+        }
+
+        if transcript.is_empty() || !cacheable_stream_transcript_complete(&transcript) {
+            return;
+        }
+
+        entry.usage = crate::cost::extract_usage_from_sse(&transcript);
+        entry.response_body = serde_json::to_string(&serde_json::json!({"raw": transcript}))
+            .unwrap_or_else(|_| "{}".to_string());
+
+        if let Err(err) = repository.upsert_response_cache_entry(entry).await {
+            tracing::warn!(error = %err, "failed to persist response cache stream entry");
+        }
+    });
+}
+
+fn cacheable_stream_transcript_complete(transcript: &str) -> bool {
+    transcript.contains("data: [DONE]")
+        || transcript.contains("event: response.completed")
+        || transcript.contains("\"type\":\"response.completed\"")
+        || transcript.contains("event: message_stop")
+        || transcript.contains("\"type\":\"message_stop\"")
+}
+
 #[derive(Clone)]
 pub struct RouterService {
     repository: Arc<SqliteRepository>,
@@ -219,17 +274,19 @@ impl RouterService {
         })
     }
 
-    /// Живые модели с системных роутов codex/claude, с кешем по провайдеру:
-    /// успех живёт 5 минут, ошибка — минуту (UI поллит /v1/models каждые 30с).
+    /// Живые модели с системных роутов codex/claude (+ custom probe), с кешем:
+    /// успех живёт 5 минут, ошибка/preset — минуту (UI поллит /v1/models каждые 30с).
     async fn native_models_catalog(&self) -> Vec<OpenAiModel> {
         let Ok(providers) = self.repository.list_provider_connections().await else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for provider in providers
-            .into_iter()
-            .filter(|p| p.enabled && native_models::supports(&p.provider))
-        {
+        for provider in providers.into_iter().filter(|p| p.enabled) {
+            let cacheable = native_models::supports(&provider.provider)
+                || provider.provider.eq_ignore_ascii_case("custom");
+            if !cacheable {
+                continue;
+            }
             {
                 let cache = self.native_models.lock().await;
                 if let Some((expires, models)) = cache.get(&provider.id)
@@ -239,11 +296,13 @@ impl RouterService {
                     continue;
                 }
             }
-            let (ttl, models) = match self.fetch_native_models(&provider).await {
-                Ok(models) => (std::time::Duration::from_secs(300), models),
-                Err(err) => {
-                    tracing::debug!(provider = %provider.id, %err, "native models fetch failed");
-                    (std::time::Duration::from_secs(60), Vec::new())
+            let (ttl, models) = match self.fetch_models_for_provider(&provider).await {
+                Ok(models) if !models.is_empty() => {
+                    (std::time::Duration::from_secs(300), models)
+                }
+                Ok(_) | Err(_) => {
+                    let fallback = self.preset_models_for_provider(&provider);
+                    (std::time::Duration::from_secs(60), fallback)
                 }
             };
             self.native_models.lock().await.insert(
@@ -253,6 +312,87 @@ impl RouterService {
             out.extend(models);
         }
         out
+    }
+
+    fn preset_models_for_provider(&self, provider: &ProviderConnection) -> Vec<OpenAiModel> {
+        let timestamp = Utc::now().timestamp();
+        native_models::preset_slugs(&provider.provider)
+            .iter()
+            .map(|slug| OpenAiModel {
+                id: format!("{}/{}", provider.model_prefix, slug),
+                object: "model".to_string(),
+                owned_by: provider.provider.clone(),
+                created: Some(timestamp),
+                kind: None,
+                dimensions: None,
+                supported_sizes: None,
+            })
+            .collect()
+    }
+
+    async fn fetch_models_for_provider(
+        &self,
+        provider: &ProviderConnection,
+    ) -> AppResult<Vec<OpenAiModel>> {
+        if provider.provider.eq_ignore_ascii_case("custom") {
+            return self.fetch_custom_models(provider).await;
+        }
+        self.fetch_native_models(provider).await
+    }
+
+    async fn fetch_custom_models(
+        &self,
+        provider: &ProviderConnection,
+    ) -> AppResult<Vec<OpenAiModel>> {
+        let accounts = self.repository.list_provider_accounts(&provider.id).await?;
+        let timestamp = Utc::now().timestamp();
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for account in accounts.into_iter().filter(|account| account.enabled) {
+            let Some(base) = account
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let client = self.clients.for_optional(account.proxy_url.as_deref())?;
+            match native_models::fetch_openai_compatible(
+                &client,
+                base,
+                account.api_key.as_deref(),
+            )
+            .await
+            {
+                Ok(ids) => {
+                    for id in ids {
+                        if seen.insert(id.clone()) {
+                            out.push(OpenAiModel {
+                                id,
+                                object: "model".to_string(),
+                                owned_by: provider.provider.clone(),
+                                created: Some(timestamp),
+                                kind: None,
+                                dimensions: None,
+                                supported_sizes: None,
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        provider = %provider.id,
+                        account = %account.id,
+                        %err,
+                        "custom models fetch failed"
+                    );
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     async fn fetch_native_models(
@@ -323,6 +463,7 @@ impl RouterService {
         suffix: Option<String>,
         passthrough_headers: Option<PassthroughHeaders>,
         request_id: String,
+        cache_context: ResponseCacheContext,
     ) -> AppResult<RoutedResult> {
         let normalized = normalize_request(endpoint, payload)?;
         let resolved_model = self.repository.resolve_alias(&normalized.model).await?;
@@ -420,7 +561,9 @@ impl RouterService {
                     &normalized.body,
                 );
 
-                let execution_targets = self.execution_targets(&provider).await?;
+                let execution_targets = self
+                    .execution_targets(&provider, upstream_endpoint)
+                    .await?;
                 if execution_targets.is_empty() {
                     continue;
                 }
@@ -474,6 +617,88 @@ impl RouterService {
                             raw_body: serde_json::to_string(&prepared_request.request_body)?,
                         },
                     );
+
+                    let cache_identity = cache_context.enabled().then(|| {
+                        build_identity(
+                            endpoint,
+                            upstream_endpoint,
+                            &normalized.model,
+                            &resolved_model,
+                            &provider.id,
+                            selected_account.as_ref().map(|account| account.id.as_str()),
+                            &cache_context.namespace,
+                            &prepared_request,
+                            normalized.stream,
+                        )
+                    });
+                    let cache_policy = if cache_context.enabled() {
+                        evaluate_policy(
+                            endpoint,
+                            &prepared_request.request_body,
+                            final_pt.as_ref(),
+                            cache_context.allow_nondeterministic_chat,
+                        )
+                    } else {
+                        crate::response_cache::ResponseCachePolicy::allow()
+                    };
+                    if cache_context.enabled() && !cache_policy.cacheable {
+                        tracing::debug!(
+                            reason = cache_policy.reason.as_deref().unwrap_or("unknown"),
+                            "response cache disabled for request by policy"
+                        );
+                    }
+                    let cache_store_expires_at = if cache_context.write && cache_policy.cacheable {
+                        cache_context.ttl.map(|ttl| Utc::now() + ttl)
+                    } else {
+                        None
+                    };
+                    if cache_context.write && cache_policy.cacheable && cache_context.ttl.is_none()
+                    {
+                        tracing::debug!("response cache write skipped because ttl is missing");
+                    }
+                    if cache_context.read
+                        && cache_policy.cacheable
+                        && let Some(identity) = cache_identity.as_ref()
+                        && let Some(cached) = self
+                            .repository
+                            .find_response_cache_entry(
+                                &identity.cache_key,
+                                &cache_context.namespace,
+                                &identity.request_body_hash,
+                            )
+                            .await?
+                    {
+                        let mut response_headers = cached.response_headers.clone();
+                        response_headers.push(("x-kou-cache".to_string(), "HIT".to_string()));
+                        let usage = cached.usage.clone();
+                        let cost_usd = usage
+                            .as_ref()
+                            .map(|usage| crate::cost::calculate_cost(&candidate, usage));
+                        tried.push(ProviderChatAttempt {
+                            provider_id: provider.id.clone(),
+                            model: candidate.clone(),
+                            status: cached.status as u16,
+                            body: "[response-cache hit]".to_string(),
+                            account: account_debug.clone(),
+                        });
+                        let body = serde_json::from_str(&cached.response_body)
+                            .unwrap_or_else(|_| serde_json::json!({"raw": cached.response_body}));
+                        return Ok(RoutedResult::Json(RoutedResponse {
+                            body,
+                            debug: RoutingDebug {
+                                request_id: request_id.clone(),
+                                requested_model: normalized.model.clone(),
+                                resolved_model: resolved_model.clone(),
+                                endpoint: endpoint.as_str().to_string(),
+                                path_suffix: suffix.clone(),
+                                tried,
+                                usage,
+                                cost_usd,
+                            },
+                            is_stream: cached.is_stream,
+                            response_headers,
+                        }));
+                    }
 
                     let retry_outcome = match self
                         .execute_with_oauth_retry(
@@ -645,6 +870,40 @@ impl RouterService {
                                     });
                                     (usage_info, cost)
                                 };
+                                if let (Some(identity), Some(expires_at)) =
+                                    (cache_identity.as_ref(), cache_store_expires_at.as_ref())
+                                {
+                                    self.repository
+                                        .upsert_response_cache_entry(NewResponseCacheEntry {
+                                            cache_key: identity.cache_key.clone(),
+                                            endpoint: endpoint.as_str().to_string(),
+                                            upstream_endpoint: upstream_endpoint
+                                                .as_str()
+                                                .to_string(),
+                                            requested_model: normalized.model.clone(),
+                                            resolved_model: resolved_model.clone(),
+                                            provider_id: provider.id.clone(),
+                                            provider_account_id: selected_account
+                                                .as_ref()
+                                                .map(|account| account.id.clone()),
+                                            namespace: cache_context.namespace.clone(),
+                                            request_body_hash: identity.request_body_hash.clone(),
+                                            response_body: serde_json::to_string(&body)?,
+                                            response_headers: cacheable_response_headers(
+                                                &resp_headers,
+                                            ),
+                                            status: i64::from(streaming.status.as_u16()),
+                                            is_stream: routed_is_stream,
+                                            usage: usage.clone(),
+                                            expires_at: expires_at.to_owned(),
+                                        })
+                                        .await?;
+                                }
+                                let mut resp_headers = resp_headers;
+                                if cache_context.read && cache_policy.cacheable {
+                                    resp_headers
+                                        .push(("x-kou-cache".to_string(), "MISS".to_string()));
+                                }
                                 tried.push(attempt);
                                 return Ok(RoutedResult::Json(RoutedResponse {
                                     body,
@@ -677,6 +936,8 @@ impl RouterService {
                             });
                             let rl_info = parse_rate_limit_headers(&streaming.response_headers);
                             self.rate_limit_tracker.update(&provider.id, &rl_info);
+                            let stream_status = streaming.status.as_u16();
+                            let stream_response_headers = streaming.response_headers;
                             let watched =
                                 watchdog_stream(streaming.stream, self.stream_idle_timeout);
                             let (teed, buffer) = tee_stream_boxerror(watched);
@@ -690,6 +951,13 @@ impl RouterService {
                             } else {
                                 teed
                             };
+                            let (client_stream, response_cache_buffer) =
+                                if cache_store_expires_at.is_some() {
+                                    let (stream, cache_buffer) = tee_stream_boxerror(client_stream);
+                                    (stream, Some(cache_buffer))
+                                } else {
+                                    (client_stream, None)
+                                };
                             persist_codex_stream_buffer_debug_log(
                                 self.repository.clone(),
                                 request_id.clone(),
@@ -697,11 +965,47 @@ impl RouterService {
                                 selected_account.as_ref().map(|account| account.id.clone()),
                                 candidate.clone(),
                                 sequence_no,
-                                streaming.status.as_u16(),
+                                stream_status,
                                 buffer.clone(),
                                 endpoint,
                                 is_codex_provider(&provider),
                             );
+                            if let (Some(identity), Some(expires_at), Some(cache_buffer)) = (
+                                cache_identity.as_ref(),
+                                cache_store_expires_at.as_ref(),
+                                response_cache_buffer,
+                            ) {
+                                spawn_stream_response_cache_write(
+                                    self.repository.clone(),
+                                    NewResponseCacheEntry {
+                                        cache_key: identity.cache_key.clone(),
+                                        endpoint: endpoint.as_str().to_string(),
+                                        upstream_endpoint: upstream_endpoint.as_str().to_string(),
+                                        requested_model: normalized.model.clone(),
+                                        resolved_model: resolved_model.clone(),
+                                        provider_id: provider.id.clone(),
+                                        provider_account_id: selected_account
+                                            .as_ref()
+                                            .map(|account| account.id.clone()),
+                                        namespace: cache_context.namespace.clone(),
+                                        request_body_hash: identity.request_body_hash.clone(),
+                                        response_body: String::new(),
+                                        response_headers: cacheable_response_headers(
+                                            &stream_response_headers,
+                                        ),
+                                        status: i64::from(stream_status),
+                                        is_stream: true,
+                                        usage: None,
+                                        expires_at: expires_at.to_owned(),
+                                    },
+                                    cache_buffer,
+                                );
+                            }
+                            let mut response_headers = stream_response_headers;
+                            if cache_context.read && cache_policy.cacheable {
+                                response_headers
+                                    .push(("x-kou-cache".to_string(), "MISS".to_string()));
+                            }
                             return Ok(RoutedResult::Stream(RoutedStream {
                                 stream: client_stream,
                                 debug: RoutingDebug {
@@ -715,7 +1019,7 @@ impl RouterService {
                                     cost_usd: None,
                                 },
                                 buffer,
-                                response_headers: streaming.response_headers,
+                                response_headers,
                             }));
                         }
                         UpstreamResult::Buffered(mut response) => {
@@ -888,6 +1192,40 @@ impl RouterService {
                                     });
                                     (usage_info, cost)
                                 };
+                                if let (Some(identity), Some(expires_at)) =
+                                    (cache_identity.as_ref(), cache_store_expires_at.as_ref())
+                                {
+                                    self.repository
+                                        .upsert_response_cache_entry(NewResponseCacheEntry {
+                                            cache_key: identity.cache_key.clone(),
+                                            endpoint: endpoint.as_str().to_string(),
+                                            upstream_endpoint: upstream_endpoint
+                                                .as_str()
+                                                .to_string(),
+                                            requested_model: normalized.model.clone(),
+                                            resolved_model: resolved_model.clone(),
+                                            provider_id: provider.id.clone(),
+                                            provider_account_id: selected_account
+                                                .as_ref()
+                                                .map(|account| account.id.clone()),
+                                            namespace: cache_context.namespace.clone(),
+                                            request_body_hash: identity.request_body_hash.clone(),
+                                            response_body: serde_json::to_string(&body)?,
+                                            response_headers: cacheable_response_headers(
+                                                &resp_headers,
+                                            ),
+                                            status: i64::from(attempt.status),
+                                            is_stream: routed_is_stream,
+                                            usage: usage.clone(),
+                                            expires_at: expires_at.to_owned(),
+                                        })
+                                        .await?;
+                                }
+                                let mut resp_headers = resp_headers;
+                                if cache_context.read && cache_policy.cacheable {
+                                    resp_headers
+                                        .push(("x-kou-cache".to_string(), "MISS".to_string()));
+                                }
 
                                 tried.push(attempt);
                                 return Ok(RoutedResult::Json(RoutedResponse {
@@ -1058,7 +1396,7 @@ impl RouterService {
         let mut debug_sequence_no = 0_i64;
         let mut last_error = None;
         for provider in matching {
-            let execution_targets = self.execution_targets(&provider).await?;
+            let execution_targets = self.execution_targets(&provider, endpoint).await?;
             if execution_targets.is_empty() {
                 continue;
             }
@@ -1190,6 +1528,7 @@ impl RouterService {
     async fn execution_targets(
         &self,
         provider: &crate::models::ProviderConnection,
+        endpoint: EndpointKind,
     ) -> AppResult<Vec<(crate::models::ProviderConnection, Option<ProviderAccount>)>> {
         let accounts = self
             .repository
@@ -1199,6 +1538,10 @@ impl RouterService {
             if provider.auth_type.eq_ignore_ascii_case("oauth") {
                 return Ok(Vec::new());
             }
+            // Custom API line is a shell: only account endpoints are usable.
+            if provider.provider.eq_ignore_ascii_case("custom") {
+                return Ok(Vec::new());
+            }
 
             return if self
                 .repository
@@ -1206,7 +1549,11 @@ impl RouterService {
                 .await?
                 .is_empty()
             {
-                Ok(vec![(provider.clone(), None)])
+                if supports_endpoint(&provider.supported_endpoints, endpoint) {
+                    Ok(vec![(provider.clone(), None)])
+                } else {
+                    Ok(Vec::new())
+                }
             } else {
                 Ok(Vec::new())
             };
@@ -1222,10 +1569,12 @@ impl RouterService {
         let mut targets = Vec::new();
         for account in accounts {
             if let Some(account) = self.prepare_provider_account(account).await? {
-                targets.push((
-                    provider_with_account_auth(provider, &account, &provider.provider),
-                    Some(account),
-                ));
+                let resolved =
+                    provider_with_account_auth(provider, &account, &provider.provider);
+                if !supports_endpoint(&resolved.supported_endpoints, endpoint) {
+                    continue;
+                }
+                targets.push((resolved, Some(account)));
             }
         }
         Ok(targets)
@@ -1255,7 +1604,13 @@ impl RouterService {
     ) -> AppResult<Option<ProviderAccount>> {
         match account.auth_mode {
             ProviderAccountAuthMode::ApiKey => {
-                Ok(has_secret(account.api_key.as_deref()).then_some(account))
+                let has_key = has_secret(account.api_key.as_deref());
+                let has_custom_endpoint = account
+                    .base_url
+                    .as_ref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                Ok((has_key || has_custom_endpoint).then_some(account))
             }
             ProviderAccountAuthMode::OAuth => {
                 let refresh_deadline = Utc::now() + Duration::minutes(5);
@@ -3653,7 +4008,10 @@ mod tests {
             .await
             .unwrap();
 
-        let targets = service.execution_targets(&provider).await.unwrap();
+        let targets = service
+            .execution_targets(&provider, EndpointKind::Responses)
+            .await
+            .unwrap();
         assert!(targets.is_empty());
     }
 
@@ -3686,7 +4044,10 @@ mod tests {
             .await
             .unwrap();
 
-        let targets = service.execution_targets(&provider).await.unwrap();
+        let targets = service
+            .execution_targets(&provider, EndpointKind::Responses)
+            .await
+            .unwrap();
         assert_eq!(targets.len(), 1);
         assert!(targets[0].1.is_none());
         assert_eq!(targets[0].0.id, provider.id);
@@ -3792,6 +4153,9 @@ mod tests {
             backoff_level: 0,
             consecutive_use_count: 0,
             proxy_url: None,
+            base_url: None,
+            protocol_format: None,
+            supported_endpoints: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

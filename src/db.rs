@@ -242,6 +242,22 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .await?;
     }
 
+    if !has_provider_account_column("base_url") {
+        sqlx::query("ALTER TABLE provider_accounts ADD COLUMN base_url TEXT")
+            .execute(&pool)
+            .await?;
+    }
+    if !has_provider_account_column("protocol_format") {
+        sqlx::query("ALTER TABLE provider_accounts ADD COLUMN protocol_format TEXT")
+            .execute(&pool)
+            .await?;
+    }
+    if !has_provider_account_column("supported_endpoints_json") {
+        sqlx::query("ALTER TABLE provider_accounts ADD COLUMN supported_endpoints_json TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_provider_accounts_connection_priority ON provider_accounts(provider_connection_id, priority, created_at)",
     )
@@ -386,6 +402,48 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_response_debug_logs_provider_created_at ON response_debug_logs(provider_id, created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS llm_response_cache (
+            cache_key TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            upstream_endpoint TEXT NOT NULL,
+            requested_model TEXT NOT NULL,
+            resolved_model TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            provider_account_id TEXT,
+            namespace TEXT NOT NULL DEFAULT '',
+            request_body_hash TEXT NOT NULL,
+            response_body TEXT NOT NULL,
+            response_headers_json TEXT NOT NULL DEFAULT '[]',
+            status INTEGER NOT NULL,
+            is_stream INTEGER NOT NULL DEFAULT 0,
+            usage_json TEXT,
+            expires_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_hit_at TEXT,
+            FOREIGN KEY(provider_id) REFERENCES provider_connections(id) ON DELETE CASCADE,
+            FOREIGN KEY(provider_account_id) REFERENCES provider_accounts(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_llm_response_cache_lookup ON llm_response_cache(cache_key, namespace, expires_at)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_llm_response_cache_expires_at ON llm_response_cache(expires_at)",
     )
     .execute(&pool)
     .await?;

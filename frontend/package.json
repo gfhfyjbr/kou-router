@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@kou/ui-kit": "file:./vendor/kou-ui-kit",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },

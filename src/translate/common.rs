@@ -52,7 +52,7 @@ pub fn openai_content_to_claude_blocks(content: &Value) -> Value {
                 .iter()
                 .filter_map(|item| {
                     let item_type = item.get("type")?.as_str()?;
-                    match item_type {
+                    let mut block = match item_type {
                         "text" => Some(json!({
                             "type": "text",
                             "text": item.get("text").and_then(|v| v.as_str()).unwrap_or("")
@@ -92,7 +92,9 @@ pub fn openai_content_to_claude_blocks(content: &Value) -> Value {
                             }
                         }
                         _ => Some(item.clone()),
-                    }
+                    }?;
+                    copy_cache_control(item, &mut block);
+                    Some(block)
                 })
                 .collect();
             Value::Array(blocks)
@@ -180,15 +182,25 @@ pub fn openai_tools_to_claude(tools: &Value) -> Value {
                 .iter()
                 .filter_map(|tool| {
                     let func = tool.get("function")?;
-                    Some(json!({
+                    let mut out = json!({
                         "name": func.get("name").cloned().unwrap_or(json!("")),
                         "description": func.get("description").cloned().unwrap_or(json!("")),
                         "input_schema": func.get("parameters").cloned().unwrap_or(json!({"type": "object"}))
-                    }))
+                    });
+                    copy_cache_control(tool, &mut out);
+                    Some(out)
                 })
                 .collect(),
         ),
         None => json!([]),
+    }
+}
+
+pub fn copy_cache_control(source: &Value, target: &mut Value) {
+    if let Some(cache_control) = source.get("cache_control").cloned()
+        && let Some(object) = target.as_object_mut()
+    {
+        object.insert("cache_control".to_string(), cache_control);
     }
 }
 

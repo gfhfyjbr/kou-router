@@ -199,7 +199,19 @@ pub fn extract_usage(body: &Value) -> Option<UsageInfo> {
             .unwrap_or(0);
         let cache_read = usage
             .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64());
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+            })
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+            });
         let cache_creation = usage
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64());
@@ -370,6 +382,31 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(50));
         assert_eq!(usage.cache_creation_tokens, Some(10));
         assert_eq!(usage.total_tokens, 280);
+    }
+
+    #[test]
+    fn test_extract_openai_cached_tokens_usage() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 100,
+                "total_tokens": 2100,
+                "prompt_tokens_details": {"cached_tokens": 1536}
+            }
+        });
+        let usage = extract_usage(&body).unwrap();
+        assert_eq!(usage.cache_read_tokens, Some(1536));
+
+        let responses_body = json!({
+            "usage": {
+                "input_tokens": 2000,
+                "output_tokens": 100,
+                "total_tokens": 2100,
+                "input_tokens_details": {"cached_tokens": 1024}
+            }
+        });
+        let usage = extract_usage(&responses_body).unwrap();
+        assert_eq!(usage.cache_read_tokens, Some(1024));
     }
 
     #[test]

@@ -14,16 +14,14 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
         })?;
 
     // Partition system messages from the rest.
-    let mut system_texts: Vec<&str> = Vec::new();
+    let mut system_blocks: Vec<Value> = Vec::new();
     let mut claude_messages: Vec<Value> = Vec::new();
 
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
         match role {
             "system" => {
-                if let Some(text) = msg["content"].as_str() {
-                    system_texts.push(text);
-                }
+                system_blocks.extend(openai_system_message_to_claude_blocks(msg));
             }
             "user" => {
                 claude_messages.push(json!({
@@ -35,10 +33,10 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
                 let mut blocks: Vec<Value> = Vec::new();
 
                 // Text content, if present.
-                if let Some(text) = msg["content"].as_str() {
-                    if !text.is_empty() {
-                        blocks.push(json!({"type": "text", "text": text}));
-                    }
+                if let Some(text) = msg["content"].as_str()
+                    && !text.is_empty()
+                {
+                    blocks.push(json!({"type": "text", "text": text}));
                 }
 
                 // Tool calls become tool_use blocks.
@@ -78,7 +76,7 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
     if body.get("response_format").is_some()
         && body["response_format"]["type"].as_str() == Some("json_object")
     {
-        system_texts.push("Respond only with valid JSON.");
+        system_blocks.push(json!({"type": "text", "text": "Respond only with valid JSON."}));
     }
 
     let mut result = json!({
@@ -90,61 +88,105 @@ pub fn translate_request(model: &str, body: &Value, stream: bool) -> AppResult<V
         "stream": stream,
     });
 
-    if !system_texts.is_empty() {
-        let joined = system_texts.join("\n");
-        result["system"] = json!([{"type": "text", "text": joined}]);
+    if !system_blocks.is_empty() {
+        result["system"] = Value::Array(system_blocks);
+    }
+
+    if let Some(cache_control) = request_cache_control(body) {
+        result["cache_control"] = cache_control;
     }
 
     // Pass-through numeric parameters.
     for key in &["temperature", "top_p", "top_k"] {
-        if let Some(v) = body.get(*key) {
-            if !v.is_null() {
-                result[*key] = v.clone();
-            }
+        if let Some(v) = body.get(*key)
+            && !v.is_null()
+        {
+            result[*key] = v.clone();
         }
     }
 
     // Tools.
-    if let Some(tools) = body.get("tools") {
-        if !tools.is_null() {
-            let converted = openai_tools_to_claude(tools);
-            if let Some(arr) = converted.as_array() {
-                if !arr.is_empty() {
-                    result["tools"] = converted;
-                }
-            }
+    if let Some(tools) = body.get("tools")
+        && !tools.is_null()
+    {
+        let converted = openai_tools_to_claude(tools);
+        if converted.as_array().is_some_and(|arr| !arr.is_empty()) {
+            result["tools"] = converted;
         }
     }
 
     // Tool choice.
-    if let Some(tc) = body.get("tool_choice") {
-        if !tc.is_null() {
-            result["tool_choice"] = match tc.as_str() {
-                Some("auto") => json!({"type": "auto"}),
-                Some("required") => json!({"type": "any"}),
-                Some("none") => {
-                    // Claude doesn't have a "none" tool_choice; omit tools instead.
-                    result.as_object_mut().unwrap().remove("tools");
-                    // Don't set tool_choice at all.
-                    Value::Null
-                }
-                _ => {
-                    // Object form: {"function":{"name":"X"}} -> {"type":"tool","name":"X"}
-                    if let Some(name) = tc.get("function").and_then(|f| f["name"].as_str()) {
-                        json!({"type": "tool", "name": name})
-                    } else {
-                        json!({"type": "auto"})
-                    }
-                }
-            };
-            // Clean up null sentinel from the "none" branch.
-            if result["tool_choice"].is_null() {
-                result.as_object_mut().unwrap().remove("tool_choice");
+    if let Some(tc) = body.get("tool_choice")
+        && !tc.is_null()
+    {
+        result["tool_choice"] = match tc.as_str() {
+            Some("auto") => json!({"type": "auto"}),
+            Some("required") => json!({"type": "any"}),
+            Some("none") => {
+                // Claude doesn't have a "none" tool_choice; omit tools instead.
+                result.as_object_mut().unwrap().remove("tools");
+                // Don't set tool_choice at all.
+                Value::Null
             }
+            _ => {
+                // Object form: {"function":{"name":"X"}} -> {"type":"tool","name":"X"}
+                if let Some(name) = tc.get("function").and_then(|f| f["name"].as_str()) {
+                    json!({"type": "tool", "name": name})
+                } else {
+                    json!({"type": "auto"})
+                }
+            }
+        };
+        // Clean up null sentinel from the "none" branch.
+        if result["tool_choice"].is_null() {
+            result.as_object_mut().unwrap().remove("tool_choice");
         }
     }
 
     Ok(result)
+}
+
+fn request_cache_control(body: &Value) -> Option<Value> {
+    body.get("cache_control")
+        .or_else(|| body.get("anthropic_cache_control"))
+        .or_else(|| body.get("claude_cache_control"))
+        .cloned()
+        .or_else(|| match body.get("prompt_cache") {
+            Some(Value::Bool(true)) => Some(json!({"type": "ephemeral"})),
+            Some(Value::Object(object)) => {
+                if let Some(cache_control) = object.get("cache_control") {
+                    Some(cache_control.clone())
+                } else if object.get("type").is_some() || object.get("ttl").is_some() {
+                    Some(Value::Object(object.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+}
+
+fn openai_system_message_to_claude_blocks(message: &Value) -> Vec<Value> {
+    let content = message.get("content").unwrap_or(&Value::Null);
+    let mut blocks = match content {
+        Value::String(text) => vec![json!({"type": "text", "text": text})],
+        Value::Array(items) => {
+            let value = openai_content_to_claude_blocks(&Value::Array(items.clone()));
+            value.as_array().cloned().unwrap_or_default()
+        }
+        Value::Null => Vec::new(),
+        other => vec![json!({"type": "text", "text": other.to_string()})],
+    };
+
+    if message.get("cache_control").is_some()
+        && !blocks
+            .iter()
+            .any(|block| block.get("cache_control").is_some())
+        && let Some(last) = blocks.last_mut()
+    {
+        copy_cache_control(message, last);
+    }
+    blocks
 }
 
 #[cfg(test)]
@@ -187,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_system_messages_joined() {
+    fn test_multiple_system_messages_become_blocks() {
         let body = json!({
             "messages": [
                 {"role": "system", "content": "First."},
@@ -196,8 +238,49 @@ mod tests {
             ]
         });
         let result = translate_request("claude-3-opus", &body, false).unwrap();
-        let system_text = result["system"][0]["text"].as_str().unwrap();
-        assert_eq!(system_text, "First.\nSecond.");
+        assert_eq!(result["system"][0]["text"], "First.");
+        assert_eq!(result["system"][1]["text"], "Second.");
+    }
+
+    #[test]
+    fn test_prompt_cache_control_passthrough() {
+        let body = json!({
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Stable system.",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Stable prefix",
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                        }
+                    ]
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "cache_control": {"type": "ephemeral"},
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "prompt_cache": {"type": "ephemeral"}
+        });
+        let result = translate_request("claude-3-opus", &body, false).unwrap();
+        assert_eq!(result["cache_control"]["type"], "ephemeral");
+        assert_eq!(result["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            result["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+        assert_eq!(result["tools"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

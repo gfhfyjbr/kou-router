@@ -227,6 +227,12 @@ The Vite dev server proxies `/api`, `/v1`, and `/health` to
 If the backend is unavailable, the UI falls back to a seeded demo mode. That is
 useful for visual checks and screenshots without touching real provider tokens.
 
+The React design system lives in the separate public
+[`kou-design-system`](https://github.com/gfhfyjbr/kou-design-system) repository
+and is consumed as the `@kou/ui-kit` Git dependency. See
+[docs/kou-design-system-git-workflow.md](docs/kou-design-system-git-workflow.md)
+for clone, update, and local UI-kit development workflow.
+
 ## Management API
 
 | Method | Path | Description |

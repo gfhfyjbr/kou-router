@@ -298,6 +298,32 @@ pub fn provider_with_account_auth(
             }
         }
     }
+
+    // Custom API accounts carry their own endpoint config.
+    if let Some(base_url) = account
+        .base_url
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        resolved.base_url = base_url.trim_end_matches('/').to_string();
+    }
+    if let Some(protocol_format) = account
+        .protocol_format
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        resolved.protocol_format = Some(protocol_format.to_string());
+    }
+    if let Some(supported_endpoints) = account
+        .supported_endpoints
+        .as_ref()
+        .filter(|values| !values.is_empty())
+    {
+        resolved.supported_endpoints = supported_endpoints.clone();
+    }
+
     resolved
 }
 

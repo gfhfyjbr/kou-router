@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
@@ -54,6 +61,44 @@ async fn spawn_identifying_mock(identifier: &str) -> String {
         axum::serve(listener, app).await.expect("serve");
     });
     format!("http://{}", addr)
+}
+
+async fn spawn_counting_mock(identifier: &str) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body = json!({
+        "id": "chatcmpl-cache",
+        "object": "chat.completion",
+        "model": "mock-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": identifier},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    });
+    let app = Router::new().route(
+        "/chat/completions",
+        post({
+            let body = body.clone();
+            let calls = calls.clone();
+            move || {
+                let body = body.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, Json(body)).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (format!("http://{}", addr), calls)
 }
 
 /// Spawn a mock that serves both `/chat/completions` (chat) and `/embeddings`.
@@ -190,6 +235,77 @@ async fn chat_request(app: &Router, model: &str) -> (StatusCode, Value) {
     (status, payload)
 }
 
+async fn cacheable_chat_request(app: &Router, model: &str) -> (StatusCode, Option<String>, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-kou-response-cache", "read-write")
+                .header("x-kou-response-cache-ttl", "60s")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "temperature": 0,
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cache_header = response
+        .headers()
+        .get("x-kou-cache")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, cache_header, payload)
+}
+
+async fn explicitly_cacheable_chat_request(
+    app: &Router,
+    model: &str,
+) -> (StatusCode, Option<String>, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-kou-response-cache", "read-write")
+                .header("x-kou-response-cache-ttl", "60s")
+                .header("x-kou-response-cache-allow-nondeterministic", "true")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cache_header = response
+        .headers()
+        .get("x-kou-cache")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: Value = serde_json::from_slice(&bytes).unwrap();
+    (status, cache_header, payload)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -240,6 +356,78 @@ async fn test_round_robin_alternates() {
     assert_eq!(s3, StatusCode::OK);
     assert_eq!(p3["choices"][0]["message"]["content"], "server-a");
     assert_eq!(p3["_kou_router"]["tried"][0]["model"], "pa/a");
+}
+
+#[tokio::test]
+async fn test_response_cache_opt_in_reuses_successful_response() {
+    let (mock, calls) = spawn_counting_mock("cached-ok").await;
+
+    let state = setup_state().await;
+    state
+        .repository
+        .create_provider_connection(new_provider(
+            "cache",
+            mock,
+            "cache",
+            "CacheProvider",
+            "cache/m",
+        ))
+        .await
+        .unwrap();
+
+    let app = build_app(state);
+    let (status, cache_header, payload) = cacheable_chat_request(&app, "cache/m").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_header.as_deref(), Some("MISS"));
+    assert_eq!(payload["choices"][0]["message"]["content"], "cached-ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (status, cache_header, payload) = cacheable_chat_request(&app, "cache/m").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_header.as_deref(), Some("HIT"));
+    assert_eq!(payload["choices"][0]["message"]["content"], "cached-ok");
+    assert_eq!(
+        payload["_kou_router"]["tried"][0]["body"],
+        "[response-cache hit]"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_response_cache_explicit_allow_reuses_chat_without_temperature() {
+    let (mock, calls) = spawn_counting_mock("explicit-cached-ok").await;
+
+    let state = setup_state().await;
+    state
+        .repository
+        .create_provider_connection(new_provider(
+            "cache",
+            mock,
+            "cache",
+            "CacheProvider",
+            "cache/m",
+        ))
+        .await
+        .unwrap();
+
+    let app = build_app(state);
+    let (status, cache_header, payload) = explicitly_cacheable_chat_request(&app, "cache/m").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_header.as_deref(), Some("MISS"));
+    assert_eq!(
+        payload["choices"][0]["message"]["content"],
+        "explicit-cached-ok"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (status, cache_header, payload) = explicitly_cacheable_chat_request(&app, "cache/m").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_header.as_deref(), Some("HIT"));
+    assert_eq!(
+        payload["_kou_router"]["tried"][0]["body"],
+        "[response-cache hit]"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
